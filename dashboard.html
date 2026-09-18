@@ -304,12 +304,12 @@ function configCard(s) {
     add("answer ceiling", c.answer_tokens + " tokens");
     add("who picks the winner", "judges " + Math.round(c.judge_weight * 100) + "%, checker " +
       Math.round((1 - c.judge_weight) * 100) + "%");
-    add("accept at", "checker score >= " + c.min_score);
+    add("corpus", "every rewritten answer is saved, nothing is filtered out");
   } else if (s.kind === "finetune") {
     add("from", c.from_model);
     add("recipe", "LoRA r=" + c.rank + " alpha=" + c.alpha + ", " + c.epochs + " epochs, lr " + c.lr +
       ", seq " + c.seq_len + ", batch " + c.batch + "x" + c.accum);
-    add("train on", "answers scoring >= " + c.min_score);
+    add("train on", "every answer in the corpus" + (c.rounds ? ", rounds " + c.rounds : ""));
   } else if (s.kind === "benchmark") {
     add("benchmarks", (c.benchmarks || Object.keys(c.catalog || {}).join(", ")));
     add("sampling", "temperature " + c.temp + ", up to " + c.solve_tokens + " tokens");
@@ -327,13 +327,14 @@ function drawOverview() {
   if (s.kind === "corpus") {
     const rounds = s.rounds || [], cur = rounds[rounds.length - 1] || {};
     const done = rounds.reduce((a, r) => a + r.done, 0), tot = rounds.reduce((a, r) => a + r.total, 0);
-    const acc = rounds.reduce((a, r) => a + r.accepted, 0);
+    const cln = rounds.reduce((a, r) => a + (r.clean || 0), 0);
     const withGain = rounds.filter(r => r.gain !== null && r.gain !== undefined);
     const gain = withGain.length ? (withGain.reduce((a, r) => a + r.gain, 0) / withGain.length).toFixed(1) : null;
     h += `<div class="kpis">
       ${kpi("rounds", rounds.length, "current round " + (cur.n || "-"))}
       ${kpi("exercises", done + "<small>/" + tot + "</small>", pct(done, tot) + "% of this run")}
-      ${kpi("accepted into corpus", acc, done ? pct(acc, done) + "% of finished" : "", "good")}
+      ${kpi("in the corpus", done, "every finished exercise", "good")}
+      ${kpi("clean", cln, done ? pct(cln, done) + "% run with no checker errors" : "")}
       ${kpi("judge score", nn(cur.judge_score) + "<small>/10</small>", "mean for the winning answer")}
       ${kpi("checker after rewrite", nn(cur.check_after) + "<small>/100</small>",
             "before the rewrite: " + nn(cur.check_before))}
@@ -352,10 +353,10 @@ function drawOverview() {
       names.map(q => `<tr><td><code>${esc(q)}</code></td><td class="muted">${esc(active[q])}</td></tr>`).join("") +
       `</tbody></table></div>`;
     h += `<h2>Rounds</h2><div class="card"><table><thead><tr><th>round</th><th>generator</th>
-      <th class="num">done</th><th class="num">accepted</th><th class="num">judge</th>
+      <th class="num">done</th><th class="num">clean</th><th class="num">judge</th>
       <th class="num">checker before</th><th class="num">after</th><th class="num">gain</th></tr></thead><tbody>` +
       rounds.map(r => `<tr><td>${r.n}</td><td><code>${esc(r.generator)}</code></td>
-        <td class="num">${r.done}/${r.total}</td><td class="num">${r.accepted}</td>
+        <td class="num">${r.done}/${r.total}</td><td class="num">${nn(r.clean)}</td>
         <td class="num">${nn(r.judge_score)}</td><td class="num">${nn(r.check_before)}</td>
         <td class="num">${nn(r.check_after)}</td>
         <td class="num ${r.gain > 0 ? "ok" : r.gain < 0 ? "bad" : ""}">${r.gain > 0 ? "+" : ""}${nn(r.gain)}</td></tr>`).join("") +
@@ -365,7 +366,7 @@ function drawOverview() {
     const step = t.step || p.step || 0, max = t.max_steps || p.max_steps || 0;
     h += `<div class="kpis">
       ${kpi("version", esc(p.version || "-"), "from " + esc((s.config || {}).from_model || "base"))}
-      ${kpi("training examples", nn((p.dataset || {}).examples), "accepted answers in the corpus")}
+      ${kpi("training examples", nn((p.dataset || {}).examples), "every answer in the corpus")}
       ${kpi("step", step + "<small>/" + (max || "?") + "</small>", pct(step, max) + "%")}
       ${kpi("loss", t.loss !== undefined && t.loss !== null ? Number(t.loss).toFixed(4) : "-",
             "epoch " + nn(t.epoch))}
@@ -445,7 +446,7 @@ async function drawCorpus() {
   let h = `<div class="controls"><label class="muted small">round</label>
     <select id="roundSel">${(d.rounds || []).map(n => `<option ${n === d.round ? "selected" : ""}>${n}</option>`).join("")}</select>
     <span class="muted small">${d.questions.filter(q => q.complete).length}/${d.questions.length} finished,
-    ${d.questions.filter(q => q.accepted).length} accepted</span></div>`;
+    ${d.questions.filter(q => q.clean).length} clean</span></div>`;
   h += `<div class="card" style="padding:2px 4px"><table><thead><tr><th>id</th><th>exercise</th><th>topic</th>
     <th>difficulty</th><th>best</th><th class="num">judges</th><th class="num">checker</th>
     <th class="num">after</th><th>status</th></tr></thead><tbody>` +
@@ -456,8 +457,8 @@ async function drawCorpus() {
       <td class="num">${nn(q.judge_score)}</td><td class="num">${nn(q.before)}</td>
       <td class="num ${q.after > q.before ? "ok" : ""}">${nn(q.after)}</td>
       <td>${q.active ? `<span class="chip acc">${esc(q.active)}</span>` :
-        q.accepted ? `<span class="chip ok">accepted</span>` :
-        q.complete ? `<span class="chip warn">rejected</span>` : `<span class="chip">waiting</span>`}</td></tr>`).join("") +
+        q.clean ? `<span class="chip ok">clean</span>` :
+        q.complete ? `<span class="chip warn">has errors</span>` : `<span class="chip">waiting</span>`}</td></tr>`).join("") +
     `</tbody></table></div>`;
   v.innerHTML = h;
   $("#roundSel").onchange = e => { corpusRound = +e.target.value; drawCorpus(); };
@@ -499,7 +500,8 @@ async function openQuestion(qid) {
   if (rec.final) h += `<h2>Rewritten answer
     <span class="muted small">checker ${nn((rec.final.check || {}).score)}/100
     ${rec.gain > 0 ? '<span class="ok">(+' + rec.gain + ')</span>' : rec.gain < 0 ? '<span class="bad">(' + rec.gain + ')</span>' : ""}
-    ${rec.accepted ? '<span class="chip ok">accepted into the corpus</span>' : '<span class="chip warn">not accepted</span>'}</span></h2>
+    <span class="chip ok">saved to the corpus</span>
+    ${rec.clean ? "" : '<span class="chip warn">has checker errors</span>'}</span></h2>
     <div class="card"><div class="small muted">${esc((rec.final.check || {}).summary || "")}</div>
     <pre class="code">${esc(rec.final.text || "")}</pre>
     ${findingsList(rec.final.check)}</div>`;
@@ -551,7 +553,7 @@ function drawTraining() {
   h += `<h2>Loss</h2><div class="card">${lossChart(steps)}</div>`;
   const cfg = s.config || {};
   h += `<h2>Recipe</h2><div class="card"><table><tbody>` +
-    ["rank", "alpha", "epochs", "lr", "seq_len", "batch", "accum", "min_score", "from_model", "rounds"]
+    ["rank", "alpha", "epochs", "lr", "seq_len", "batch", "accum", "from_model", "rounds"]
       .map(k => `<tr><td class="muted">${k}</td><td><code>${esc(nn(cfg[k], "-"))}</code></td></tr>`).join("") +
     `</tbody></table></div>`;
   if ((t.log || []).length) h += `<h2>Trainer output</h2><div class="card feed">` +

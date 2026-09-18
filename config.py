@@ -64,7 +64,6 @@ DEFAULTS = {
         "question_temp": 1.0,
         "refine_temp": 0.35,
         "judge_weight": 0.7,
-        "min_score": 55,
         "recall_full": 60,
         "recall_chars": 60000,
         "exec_timeout": 25,
@@ -105,7 +104,6 @@ DEFAULTS = {
         "rank": 32,
         "alpha": 64,
         "save_steps": 25,
-        "min_score": 60,
         "min_examples": 20,
         "load_4bit": False,
         "force_torch": False,
@@ -232,7 +230,8 @@ COMMENTS = {
               "them whole, never truncated, so this also decides how big the judge context has to be.\n"
               "`judge_weight` splits the winner decision between the judges and the programmatic\n"
               "checker (1 = judges alone, 0 = checker alone). `recall_full` / `recall_chars` decide how\n"
-              "much of the previous questionnaire is shown when writing the next one.",
+              "much of the previous questionnaire is shown when writing the next one. Every rewritten\n"
+              "answer goes into the corpus - nothing here filters one out.",
     "corpus.difficulty_mix": "Fractions of each round that are easy and hard; the rest are medium.",
     "corpus.short_share": "Fraction of each round that is a short exercise; the rest are long.",
     "corpus.axis_weights": "How the four judge axes combine into one number when ranking answers.",
@@ -246,7 +245,8 @@ COMMENTS = {
                "actual run of the code. `penalties` and `bonuses` are points off and on a 0-100 score.",
     "finetune": "Phase 2 (finetune.py). `from_model` is `base` for a clean run from the untouched model\n"
                 "on the whole corpus, or `latest`/`v1` to keep training that version's own weights on\n"
-                "the rounds it has not seen yet.",
+                "the rounds it has not seen yet. Every answer in the chosen rounds is trained on;\n"
+                "nothing here filters the corpus.",
     "benchmarks": "Phase 3 (benchmark.py). `use` picks from `catalog` below; anything named there is\n"
                   "downloaded on first use. `probe` is the memorization screen - every problem is shown\n"
                   "half-finished to the base model, and one it can reproduce verbatim is flagged, so\n"

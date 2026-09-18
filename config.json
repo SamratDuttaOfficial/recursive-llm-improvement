@@ -37,7 +37,8 @@
   // them whole, never truncated, so this also decides how big the judge context has to be.
   // `judge_weight` splits the winner decision between the judges and the programmatic
   // checker (1 = judges alone, 0 = checker alone). `recall_full` / `recall_chars` decide how
-  // much of the previous questionnaire is shown when writing the next one.
+  // much of the previous questionnaire is shown when writing the next one. Every rewritten
+  // answer goes into the corpus - nothing here filters one out.
   "corpus": {
     "questions_per_round": 24,
     "rounds": 1,
@@ -48,7 +49,6 @@
     "question_temp": 1.0,
     "refine_temp": 0.35,
     "judge_weight": 0.7,
-    "min_score": 55,
     "recall_full": 60,
     "recall_chars": 60000,
     "exec_timeout": 25,
@@ -180,7 +180,8 @@
 
   // Phase 2 (finetune.py). `from_model` is `base` for a clean run from the untouched model
   // on the whole corpus, or `latest`/`v1` to keep training that version's own weights on
-  // the rounds it has not seen yet.
+  // the rounds it has not seen yet. Every answer in the chosen rounds is trained on;
+  // nothing here filters the corpus.
   "finetune": {
     "from_model": "base",
     "epochs": 3.0,
@@ -191,7 +192,6 @@
     "rank": 32,
     "alpha": 64,
     "save_steps": 25,
-    "min_score": 60,
     "min_examples": 20,
     "load_4bit": false,
     "force_torch": false,

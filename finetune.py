@@ -3,7 +3,7 @@
 
     python finetune.py
 
-One command again. It builds the training set out of the accepted answers, creates a project virtual
+One command again. It builds the training set out of the whole corpus, creates a project virtual
 environment, installs the right stack for this machine (PyTorch + PEFT on NVIDIA/CPU, MLX on Apple silicon),
 downloads the base weights in Hugging Face format, trains a LoRA, merges it, converts the result to GGUF and
 registers it as the next model version, which `run.py --generator latest` and `benchmark.py` then pick up.
@@ -32,7 +32,7 @@ CONFIG_MAP = {
     "epochs": "finetune.epochs", "batch": "finetune.batch", "accum": "finetune.accum",
     "seq_len": "finetune.seq_len", "lr": "finetune.lr", "rank": "finetune.rank",
     "alpha": "finetune.alpha", "save_steps": "finetune.save_steps",
-    "min_score": "finetune.min_score", "min_examples": "finetune.min_examples",
+    "min_examples": "finetune.min_examples",
     "dash_port": "ui.ports.finetune",
 }
 
@@ -53,7 +53,12 @@ def corpus_rounds(run):
 
 
 def build_dataset(a, out_dir):
-    """Every accepted answer from the requested rounds, newest rounds last, de-duplicated by exercise."""
+    """Every corpus answer from the requested rounds, newest rounds last, de-duplicated by exercise.
+
+    Nothing is held back. run.py saves an answer for each exercise and all of them are trained on; what
+    the model did badly is part of what it did. The checker score rides along on each row so the report
+    can show the spread.
+    """
     corpus_dir = os.path.join(STATE, a.run, "corpus")
     if not os.path.isdir(corpus_dir):
         sys.exit("no corpus yet in " + corpus_dir + " - run `python run.py` first")
@@ -66,8 +71,6 @@ def build_dataset(a, out_dir):
         n = int(re.findall(r"\d+", f)[0])
         per_round.setdefault(n, 0)
         for it in read_jsonl(os.path.join(corpus_dir, f)):
-            if it.get("check_score", 0) < a.min_score:
-                continue
             key = re.sub(r"\W+", "", (it.get("title") or it.get("qid", "")).lower())
             seen[key] = it          # a later round's answer to the same exercise replaces the earlier one
     for it in seen.values():
@@ -77,7 +80,7 @@ def build_dataset(a, out_dir):
                      "score": it.get("check_score"), "chars": len(text)})
     rows.sort(key=lambda r: (r["round"], r["qid"]))
     if len(rows) < a.min_examples:
-        sys.exit("only " + str(len(rows)) + " accepted answers (need at least " + str(a.min_examples) +
+        sys.exit("only " + str(len(rows)) + " answers in the corpus (need at least " + str(a.min_examples) +
                  "). Generate more with:  python run.py --new")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "dataset.jsonl")
@@ -378,7 +381,6 @@ def main():
     ap.add_argument("--rank", type=int, default=O)
     ap.add_argument("--alpha", type=int, default=O)
     ap.add_argument("--save-steps", type=int, default=O)
-    ap.add_argument("--min-score", type=int, default=O, help="checker score an answer needs to be trained on")
     ap.add_argument("--min-examples", type=int, default=O)
     ap.add_argument("--load-4bit", action="store_true", help="load the base in 4-bit (tight GPUs)")
     ap.add_argument("--force-torch", action="store_true", help="use PyTorch even on Apple silicon")
@@ -444,7 +446,7 @@ def main():
 
     try:
         # ---- 1. dataset
-        phase("dataset", "collecting accepted answers")
+        phase("dataset", "collecting the corpus answers")
         data = os.path.join(out_dir, "dataset.jsonl")
         if not prog.get("dataset") or not os.path.exists(data):
             data, stats = build_dataset(a, out_dir)

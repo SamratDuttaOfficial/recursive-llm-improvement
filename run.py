@@ -44,7 +44,7 @@ CONFIG_MAP = {
     "answer_tokens": "corpus.answer_tokens", "judge_tokens": "corpus.judge_tokens",
     "question_tokens": "corpus.question_tokens", "summary_tokens": "corpus.summary_tokens",
     "question_temp": "corpus.question_temp", "refine_temp": "corpus.refine_temp",
-    "judge_weight": "corpus.judge_weight", "min_score": "corpus.min_score",
+    "judge_weight": "corpus.judge_weight",
     "exec_timeout": "corpus.exec_timeout", "ctx": "corpus.ctx",
     "workers": "parallel.workers", "slots": "parallel.slots", "backend": "parallel.backend",
     "port": "server.port_corpus", "dash_port": "ui.ports.corpus", "report_every": "ui.report_every",
@@ -181,13 +181,13 @@ class Run:
             qs = s.questions(n)
             recs = [s.record(n, q["qid"]) for q in qs]
             done = [r for r in recs if r and r.get("complete")]
-            acc = [r for r in done if r.get("accepted")]
+            clean = [r for r in done if r.get("clean")]
             jsc = [r["verdict"]["best_score"] for r in done if r.get("verdict")]
             b4 = [best_answer(r)["check"]["score"]
                   for r in done if r.get("verdict") and best_answer(r)]
             af = [r["final"]["check"]["score"] for r in done if r.get("final")]
             rounds.append({
-                "n": n, "total": len(qs), "done": len(done), "accepted": len(acc),
+                "n": n, "total": len(qs), "done": len(done), "clean": len(clean),
                 "generator": (read_json(os.path.join(s.round_dir(n), "info.json"), {}) or {}).get("generator", "?"),
                 "judge_score": round(sum(jsc) / len(jsc), 2) if jsc else None,
                 "check_before": round(sum(b4) / len(b4), 1) if b4 else None,
@@ -311,7 +311,7 @@ class Loop:
             "qid": q["qid"], "round": n_round, "question": q, "t_start": time.time(),
             "generator": s.backend.entries["gen"]["id"], "judge_model": s.backend.entries["judge"]["id"],
             "answers": [], "judges": [], "verdict": None, "lint_summary": None, "final": None,
-            "complete": False, "accepted": False}
+            "complete": False, "clean": False}
         save = lambda: s.r.save_record(n_round, rec)
         where = lambda st: s.r.active.__setitem__(q["qid"], st)
         checks = prompts.fmt_checks(q.get("checks"))
@@ -404,20 +404,23 @@ class Loop:
             save()
         check_stop()
 
-        # --- 6. accept or not, and the training pair
+        # --- 6. save the answer and the training pair
         fin = rec["final"]
-        rec["accepted"] = bool(fin["code"]) and fin["check"]["counts"].get("error", 0) == 0 and \
-            fin["check"]["score"] >= s.a.min_score
+        # Every rewrite is saved. Producing an answer for each exercise is the job; deciding which
+        # exercises deserve to have one is not. An answer that came out badly is still what this model
+        # does with that question, and dropping it would quietly hide that. `clean` is a label for the
+        # reports only - it never keeps a row out - and the checker score travels with the row so that
+        # a later step can weigh it.
+        rec["clean"] = bool(fin["code"]) and fin["check"]["counts"].get("error", 0) == 0
         rec["gain"] = fin["check"]["score"] - best["check"]["score"]
         rec["complete"] = True
         rec["t_end"] = time.time()
         save()
-        if rec["accepted"]:
-            append_jsonl(s.r.corpus_path(n_round), {
-                "qid": q["qid"], "round": n_round, "title": q["title"], "topic": q["topic"],
-                "difficulty": q["difficulty"], "size": q["size"], "question": q["question"],
-                "answer": fin["text"], "check_score": fin["check"]["score"],
-                "judge_score": rec["verdict"]["best_score"], "generator": rec["generator"]})
+        append_jsonl(s.r.corpus_path(n_round), {
+            "qid": q["qid"], "round": n_round, "title": q["title"], "topic": q["topic"],
+            "difficulty": q["difficulty"], "size": q["size"], "question": q["question"],
+            "answer": fin["text"], "check_score": fin["check"]["score"], "clean": rec["clean"],
+            "judge_score": rec["verdict"]["best_score"], "generator": rec["generator"]})
         s.r.active.pop(q["qid"], None)
         return rec
 
@@ -569,14 +572,14 @@ def report(r, final=False):
     if not rows:
         return
     w = Log.paint
-    head = ("  round  gen        done      accepted   judge  checker  after  gain")
+    head = ("  round  gen        done         clean   judge  checker  after  gain")
     lines = ["", w(head, "bold")]
     for row in rows:
         gain = row["gain"]
         gtxt = ("+" if gain and gain > 0 else "") + (str(gain) if gain is not None else "-")
         lines.append("  " + str(row["n"]).rjust(5) + "  " + str(row["generator"])[:9].ljust(9) + "  " +
                      (str(row["done"]) + "/" + str(row["total"])).rjust(8) + "  " +
-                     str(row["accepted"]).rjust(9) + "  " +
+                     str(row["clean"]).rjust(9) + "  " +
                      (str(row["judge_score"]) if row["judge_score"] is not None else "-").rjust(6) + "  " +
                      (str(row["check_before"]) if row["check_before"] is not None else "-").rjust(7) + "  " +
                      (str(row["check_after"]) if row["check_after"] is not None else "-").rjust(6) + "  " +
@@ -614,7 +617,7 @@ def make_api(r):
                 rec = r.record(n, item["qid"]) or {}
                 out.append({"qid": item["qid"], "title": item["title"], "topic": item["topic"],
                             "difficulty": item["difficulty"], "size": item["size"],
-                            "complete": bool(rec.get("complete")), "accepted": bool(rec.get("accepted")),
+                            "complete": bool(rec.get("complete")), "clean": bool(rec.get("clean")),
                             "best": (rec.get("verdict") or {}).get("best"),
                             "judge_score": (rec.get("verdict") or {}).get("best_score"),
                             "before": ((best_answer(rec) or {}).get("check", {}).get("score")
@@ -657,7 +660,7 @@ def decide_round(r, args):
         return None, False
     print("")
     print("  Round " + str(nums[-1]) + " is finished (" + str(len(r.questions(nums[-1]))) +
-          " exercises, " + str(len(read_jsonl(r.corpus_path(nums[-1])))) + " accepted into the corpus).")
+          " exercises, " + str(len(read_jsonl(r.corpus_path(nums[-1])))) + " answers in the corpus).")
     try:
         ans = input("  Generate a new set of " + str(r.a.questions) + " exercises? [Y/n] ").strip().lower()
     except EOFError:
@@ -700,8 +703,6 @@ def main():
     ap.add_argument("--judge-weight", type=float, default=O,
                     help="how much the judges decide the winner, the rest coming from the programmatic "
                          "checker (0 = the checker alone, 1 = the judges alone)")
-    ap.add_argument("--min-score", type=int, default=O,
-                    help="a rewritten answer below this checker score is not put in the corpus")
     ap.add_argument("--exec-timeout", type=int, default=O, help="seconds an answer may run for")
     ap.add_argument("--no-exec", action="store_true", help="lint only, never run the generated code")
     ap.add_argument("--port", type=int, default=O)
@@ -809,7 +810,7 @@ def main():
         log("stop", "stopped cleanly - every finished step is on disk. Re-run the same command to resume.", "yellow")
     else:
         total = sum(len(read_jsonl(r.corpus_path(n))) for n in r.round_nums())
-        log("done", "corpus now holds " + str(total) + " accepted answers across " +
+        log("done", "corpus now holds " + str(total) + " answers across " +
             str(len(r.round_nums())) + " rounds", "green")
         log("next", "train on it with:  python finetune.py        then measure:  python benchmark.py", "bold")
 
@@ -852,13 +853,13 @@ def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
                     continue
                 done += 1
                 eta = (time.time() - t0) / done * (len(todo) - done)
-                mark = "accepted" if rec["accepted"] else "rejected"
+                mark = "clean" if rec["clean"] else "saved, has errors"
                 log("result", q["qid"] + " " + q["title"][:38].ljust(38) + " best=" + rec["verdict"]["best"] +
                     " judges=" + str(rec["verdict"]["best_score"]) + "/10  checker " +
                     str((best_answer(rec) or {}).get("check", {}).get("score")) + "->" +
                     str(rec["final"]["check"]["score"]) + "  " + mark + "   (" + str(done) + "/" +
                     str(len(todo)) + ", eta " + fmt_t(eta) + ")",
-                    "green" if rec["accepted"] else "yellow")
+                    "green" if rec["clean"] else "yellow")
         except (KeyboardInterrupt, Interrupted):
             Stop.set()
         if Stop.is_set():
@@ -880,7 +881,7 @@ def banner(a, r):
              "  context    solvers " + str(a.gen_ctx) + " per slot, judges " + str(a.judge_ctx) +
              " per slot (every answer in full, never truncated)",
              "  checker    compile + AST + ruff" + ("" if not a.no_exec else " (execution off)") +
-             ", accept at score >= " + str(a.min_score),
+             ", scoring only - no answer is filtered out",
              "  machine    " + (g["name"] + " " + str(g["total"]) + " MB " +
                                 ("unified" if g.get("unified") else "VRAM") if g else "no GPU detected"),
              ""]

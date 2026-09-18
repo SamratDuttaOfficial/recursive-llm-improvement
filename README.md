@@ -78,8 +78,8 @@ Change it, run again, and whatever it names - a different model, another benchma
    run.py                      finetune.py                  benchmark.py
    ──────                      ───────────                  ────────────
    write exercises             build the training set       download LBPP + EvoEval
-   3 solvers answer            LoRA on the accepted         probe the base model for memorisation
-   checker: compile/lint/run     answers                    run every problem, execute the real tests
+   3 solvers answer            LoRA on the corpus           probe the base model for memorisation
+   checker: compile/lint/run                                run every problem, execute the real tests
    3 judges score in JSON      merge + convert to GGUF      compare each version against the base
    pick the winner             register as v1, v2, ...
    rewrite it with the
@@ -140,9 +140,15 @@ fail to return usable JSON the checker decides by itself.
 findings go back to the model, which produces the corrected solution. That is checked again and saved as
 the training pair, with the before/after checker scores so you can see whether the rewrite actually helped.
 
+**Every rewrite is saved, and every saved answer is trained on.** There is no quality gate anywhere in the
+pipeline: one exercise in, one training pair out, and the whole corpus goes into the fine-tune. A rewrite
+that still has checker errors is written all the same and flagged `clean: false`, because what the model
+does badly is a fact about the model, and dropping it would hide that from the very report meant to show
+it. The checker score is on every row, so the spread is visible without anything being thrown away.
+
 ## Phase 2 - fine-tuning (`finetune.py`)
 
-LoRA (rank 32, alpha 64, 3 epochs, cosine schedule) over the accepted answers in ChatML format, then merged
+LoRA (rank 32, alpha 64, 3 epochs, cosine schedule) over the corpus in ChatML format, then merged
 into the base weights and converted to GGUF so the next round can be served by the same `llama-server`.
 
 - **NVIDIA / CPU**: PyTorch + PEFT, bf16, gradient checkpointing, resumed from the last `checkpoint-N`.
@@ -270,7 +276,7 @@ straight from disk it finds whichever phase is running by probing ports 8777-878
 config.json                                   the model, the agents, the prompts, the benchmarks
 state/<run>/rounds/round_001/questions.json   the exercise set
 state/<run>/rounds/round_001/q_r001q007.json  one exercise: every answer, every judge, verdict, rewrite
-state/<run>/corpus/round_001.jsonl            the accepted training pairs
+state/<run>/corpus/round_001.jsonl            one training pair per exercise, nothing filtered out
 state/<run>/ft/v1/                            dataset, checkpoints, adapter, merged model, progress
 state/<run>/ft/v2/                            the next version (from base, or stacked on v1)
 state/<run>/bench/<model>/<bench>/            one file per problem, plus the summaries
@@ -291,8 +297,7 @@ scripts also take `--config PATH`, `--print-config` and `--init-config`.
 `--rounds 3` rounds in one go - `--new` / `--no-new` - `--workers N` - `--slots N` -
 `--answer-tokens 20000` the ceiling for one answer - `--judge-weight 0.7` judges against checker -
 `--recall-full 60` / `--recall-chars 60000` how much of the previous questionnaire is shown -
-`--min-score 55` the checker score an answer needs to enter the corpus - `--no-exec` lint without running -
-`--run name` a separate experiment - `-v`
+`--no-exec` lint without running - `--run name` a separate experiment - `-v`
 
 **`finetune.py`** `--rounds 1,2` which corpus rounds - `--from-model base|latest|v1` retrain from base or
 stack on a version - `--version v4` name it - `--epochs`, `--lr`, `--rank`, `--seq-len`, `--batch`,
