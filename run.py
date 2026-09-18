@@ -40,10 +40,11 @@ SLOTS = {"A": 0, "B": 1, "C": 2}
 CONFIG_MAP = {
     "model": "model.base", "generator": "model.generator", "judge_model": "model.judge",
     "questions": "corpus.questions_per_round", "rounds": "corpus.rounds",
-    "recall_full": "corpus.recall_full", "recall_chars": "corpus.recall_chars",
     "answer_tokens": "corpus.answer_tokens", "judge_tokens": "corpus.judge_tokens",
     "question_tokens": "corpus.question_tokens", "summary_tokens": "corpus.summary_tokens",
-    "question_temp": "corpus.question_temp", "refine_temp": "corpus.refine_temp",
+    "question_batch": "corpus.question_batch", "question_temp": "corpus.question_temp",
+    "question_top_k": "corpus.question_top_k", "question_top_p": "corpus.question_top_p",
+    "question_min_p": "corpus.question_min_p", "refine_temp": "corpus.refine_temp",
     "judge_weight": "corpus.judge_weight",
     "exec_timeout": "corpus.exec_timeout", "ctx": "corpus.ctx",
     "workers": "parallel.workers", "slots": "parallel.slots", "backend": "parallel.backend",
@@ -218,71 +219,56 @@ class Loop:
         info["tps"] = round(info["out"] / max(0.1, info["secs"]), 1)
         return text, info
 
-    def previous_text(s, questions, budget):
-        """The previous exercises written out in full, newest first, until the character budget runs out."""
-        out, used = [], 0
-        for q in reversed(questions or []):
-            block = ("### " + str(q.get("title", "")) + "  (" + str(q.get("difficulty", "")) + ", " +
-                     str(q.get("topic", "")) + ")\n" + str(q.get("question", "")).strip())
-            if out and used + len(block) > budget:
-                break
-            out.append(block)
-            used += len(block)
-        return "\n\n".join(reversed(out)) if out else "(none yet)"
-
     # ------------------------------------------------ question set
-    def avoid_text(s, prev):
-        """The previous questionnaire as the prompt sees it. It goes back into the context in full, not as a
-        list of names: the model can only avoid re-asking something if it can see what was actually asked.
-        The most recent exercises are sent whole and anything older degrades to its title, so the prompt
-        stays bounded - `recall_full` and `recall_chars` in the config decide where that line is."""
-        a = s.a
-        if not prev:
-            return prompts.AVOID_NONE
-        return prompts.fill(
-            prompts.AVOID_SOME,
-            exercises=s.previous_text(prev[-a.recall_full:], a.recall_chars),
-            titles="\n".join("- " + str(q.get("title", "")) for q in prev[:-a.recall_full]) or "(none)")
-
-    def question_user(s, need, prev):
+    def question_user(s, need):
         a = s.a
         easy = max(1, round(need * a.easy_share))
         hard = max(1, round(need * a.hard_share))
         short = round(need * a.short_share)
         return prompts.fill(prompts.QUESTION_USER, n=need, easy=easy, hard=hard,
-                            medium=max(0, need - easy - hard), short=short, long=need - short,
-                            avoid=s.avoid_text(prev))
+                            medium=max(0, need - easy - hard), short=short, long=need - short)
 
     def make_questions(s, n_round, count):
+        """Write the exercise set a few at a time.
+
+        One call for the whole set does not work. Asked for 24 objects a small model writes a handful and
+        closes the array, and a set that does comply overruns `question_tokens` and is cut off mid-object.
+        Either way the next attempt asks for the remainder, gets the same obvious exercises back, and the
+        round ends far short. A small batch is what the model can actually finish, and each one is a fresh
+        draw - which is also where the variety comes from. Nothing it has already written goes back into
+        the prompt; `question_temp` and the sampling beside it are what keep the sets apart, and the only
+        thing carried over is the set of titles already used, refused here rather than argued about there.
+        """
         a = s.a
-        prev = []
+        used_titles = set()
         for m in s.r.round_nums():
-            prev += s.r.questions(m)
+            used_titles |= {str(q.get("title", "")) for q in s.r.questions(m)}
         system = prompts.fill(prompts.QUESTION_SYSTEM, budget=a.answer_tokens)
-        out, tries, barren = [], 0, 0
-        while len(out) < count and tries < 6 and not Stop.is_set():
-            tries += 1
-            phase("questions", "round " + str(n_round) + ": asking for " +
-                  str(count - len(out)) + " more exercises (attempt " + str(tries) + ")")
-            need, before = count - len(out), len(out)
-            u = s.question_user(need, prev + out)
-            text, info = s.call("gen", system, u, a.question_tokens, a.question_temp,
-                                {"top_p": 0.95, "top_k": 60}, "question set " + str(n_round), "questions")
+        sampler = {"top_k": a.question_top_k, "top_p": a.question_top_p, "min_p": a.question_min_p}
+        batch = max(1, int(a.question_batch or 6))
+        out, calls, barren = [], 0, 0
+        limit = max(6, -(-count // batch) * 3)      # three shots at every batch before giving up
+        while len(out) < count and calls < limit and not Stop.is_set():
+            calls += 1
+            need, before = min(batch, count - len(out)), len(out)
+            phase("questions", "round " + str(n_round) + ": " + str(len(out)) + "/" + str(count) +
+                  " written, asking for " + str(need) + " more")
+            text, info = s.call("gen", system, s.question_user(need), a.question_tokens, a.question_temp,
+                                sampler, "question set " + str(n_round), "questions")
             items = loose_json(text)
             if isinstance(items, dict):
                 items = items.get("exercises") or items.get("questions") or [items]
             if not isinstance(items, list):
-                log("warn", "the question set did not parse as JSON; retrying", "yellow")
-                continue
-            have = {q["title"] for q in out} | {str(q.get("title", "")) for q in prev}
+                log("warn", "that batch did not parse as JSON; asking again", "yellow")
+                items = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
                 title = str(it.get("title") or "").strip().lower().replace(" ", "-")[:60]
                 body = str(it.get("question") or "").strip()
-                if not title or len(body) < 40 or title in have:
+                if not title or len(body) < 40 or title in used_titles:
                     continue
-                have.add(title)
+                used_titles.add(title)
                 checks = it.get("checks") or []
                 if isinstance(checks, str):
                     checks = [checks]
@@ -293,15 +279,18 @@ class Loop:
                 if len(out) >= count:
                     break
             log("questions", "round " + str(n_round) + ": " + str(len(out)) + "/" + str(count) +
-                " exercises after attempt " + str(tries))
+                " exercises after " + str(calls) + " call(s)")
             if len(out) == before:
                 barren += 1
-                if barren >= 2:
-                    log("warn", "the model only returns exercises that already exist; stopping this set at " +
-                        str(len(out)), "yellow")
+                if barren >= 4:
+                    log("warn", "four batches running with nothing new in them; stopping this set at " +
+                        str(len(out)) + ". Raise corpus.question_temp for more variety.", "yellow")
                     break
             else:
                 barren = 0
+        if len(out) < count:
+            log("warn", "round " + str(n_round) + " has " + str(len(out)) + " exercises, not " + str(count),
+                "yellow")
         return out
 
     # ------------------------------------------------ one exercise, end to end
@@ -681,10 +670,8 @@ def main():
                     help="who writes the questions and the answers: base | latest | v2 | path.gguf")
     ap.add_argument("--judge-model", default=O, help="who judges (kept on the base model by design)")
     ap.add_argument("--questions", type=int, default=O, help="exercises per round")
-    ap.add_argument("--recall-full", type=int, default=O,
-                    help="how many of the most recent exercises are shown in full when writing the next set")
-    ap.add_argument("--recall-chars", type=int, default=O,
-                    help="character budget for those exercises; anything older degrades to its title")
+    ap.add_argument("--question-batch", type=int, default=O,
+                    help="how many exercises to ask for per call while filling a round")
     ap.add_argument("--new", action="store_true", help="start a new round without asking")
     ap.add_argument("--force-new", action="store_true", help="start a new round even if one is unfinished")
     ap.add_argument("--no-new", action="store_true", help="only finish what is pending, never ask")
@@ -698,7 +685,11 @@ def main():
     ap.add_argument("--judge-tokens", type=int, default=O)
     ap.add_argument("--question-tokens", type=int, default=O)
     ap.add_argument("--summary-tokens", type=int, default=O)
-    ap.add_argument("--question-temp", type=float, default=O)
+    ap.add_argument("--question-temp", type=float, default=O,
+                    help="how adventurous the exercise writer is; the only source of variety between sets")
+    ap.add_argument("--question-top-k", type=int, default=O)
+    ap.add_argument("--question-top-p", type=float, default=O)
+    ap.add_argument("--question-min-p", type=float, default=O)
     ap.add_argument("--refine-temp", type=float, default=O)
     ap.add_argument("--judge-weight", type=float, default=O,
                     help="how much the judges decide the winner, the rest coming from the programmatic "

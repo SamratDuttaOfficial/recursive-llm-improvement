@@ -36,9 +36,8 @@
   // Phase 1 (run.py). `answer_tokens` is the ceiling for one answer - the judges read all of
   // them whole, never truncated, so this also decides how big the judge context has to be.
   // `judge_weight` splits the winner decision between the judges and the programmatic
-  // checker (1 = judges alone, 0 = checker alone). `recall_full` / `recall_chars` decide how
-  // much of the previous questionnaire is shown when writing the next one. Every rewritten
-  // answer goes into the corpus - nothing here filters one out.
+  // checker (1 = judges alone, 0 = checker alone). Every rewritten answer goes into the
+  // corpus - nothing here filters one out.
   "corpus": {
     "questions_per_round": 24,
     "rounds": 1,
@@ -46,11 +45,21 @@
     "judge_tokens": 3000,
     "question_tokens": 4000,
     "summary_tokens": 700,
-    "question_temp": 1.0,
+
+    // How many exercises to ask for per call. A small model cannot write a whole
+    // set in one answer, so the round is filled a batch at a time.
+    "question_batch": 6,
+
+    // Sampling for the exercise writer, and the only thing keeping one set
+    // different from the next - nothing it has already written is put back in
+    // front of it. Turn these up for stranger exercises, down if the JSON starts
+    // coming back malformed.
+    "question_temp": 1.25,
+    "question_top_k": 120,
+    "question_top_p": 0.98,
+    "question_min_p": 0.02,
     "refine_temp": 0.35,
     "judge_weight": 0.7,
-    "recall_full": 60,
-    "recall_chars": 60000,
     "exec_timeout": 25,
     "run_code": true,
     "ctx": 0,
@@ -383,27 +392,10 @@
       "Mix of difficulty: about {easy} easy, {medium} medium, {hard} hard.",
       "Mix of size: about {short} short and {long} long.",
       "Spread them across different topics - do not write several exercises on the same topic.",
-      "",
-      "{avoid}",
+      "Reach for something you would not think of first: an unusual domain, an awkward constraint, a shape of",
+      "problem that is not the textbook one.",
       "",
       "Output the JSON array now."
-    ],
-    "avoid_none": "This is the first set, so any topic is fair game.",
-    "avoid_some": [
-      "These exercises already exist. Do NOT repeat any of them, do not rephrase them, and do not",
-      "write a near-duplicate - the same algorithm with different names, or the same idea wearing a different",
-      "story, both count as duplicates. Read them, then deliberately pick different topics and different shapes of",
-      "problem.",
-      "",
-      "# Already written, in full",
-      "",
-      "{exercises}",
-      "",
-      "# Also already written (titles only)",
-      "",
-      "{titles}",
-      "",
-      "Now write exercises that are genuinely new next to all of the above."
     ],
     "solver_base": [
       "You are an expert Python engineer. You write correct, readable, idiomatic Python 3.10+.",

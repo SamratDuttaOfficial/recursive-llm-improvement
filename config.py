@@ -61,11 +61,13 @@ DEFAULTS = {
         "judge_tokens": 3000,
         "question_tokens": 4000,
         "summary_tokens": 700,
-        "question_temp": 1.0,
+        "question_batch": 6,
+        "question_temp": 1.25,
+        "question_top_k": 120,
+        "question_top_p": 0.98,
+        "question_min_p": 0.02,
         "refine_temp": 0.35,
         "judge_weight": 0.7,
-        "recall_full": 60,
-        "recall_chars": 60000,
         "exec_timeout": 25,
         "run_code": True,
         "ctx": 0,
@@ -191,8 +193,6 @@ DEFAULTS = {
     "prompts": {
         "question_system": prompts.QUESTION_SYSTEM,
         "question_user": prompts.QUESTION_USER,
-        "avoid_none": prompts.AVOID_NONE,
-        "avoid_some": prompts.AVOID_SOME,
         "solver_base": prompts.SOLVER_BASE,
         "solver_user": prompts.SOLVER_USER,
         "judge_base": prompts.JUDGE_BASE,
@@ -229,9 +229,14 @@ COMMENTS = {
     "corpus": "Phase 1 (run.py). `answer_tokens` is the ceiling for one answer - the judges read all of\n"
               "them whole, never truncated, so this also decides how big the judge context has to be.\n"
               "`judge_weight` splits the winner decision between the judges and the programmatic\n"
-              "checker (1 = judges alone, 0 = checker alone). `recall_full` / `recall_chars` decide how\n"
-              "much of the previous questionnaire is shown when writing the next one. Every rewritten\n"
-              "answer goes into the corpus - nothing here filters one out.",
+              "checker (1 = judges alone, 0 = checker alone). Every rewritten answer goes into the\n"
+              "corpus - nothing here filters one out.",
+    "corpus.question_batch": "How many exercises to ask for per call. A small model cannot write a whole\n"
+                             "set in one answer, so the round is filled a batch at a time.",
+    "corpus.question_temp": "Sampling for the exercise writer, and the only thing keeping one set\n"
+                            "different from the next - nothing it has already written is put back in\n"
+                            "front of it. Turn these up for stranger exercises, down if the JSON starts\n"
+                            "coming back malformed.",
     "corpus.difficulty_mix": "Fractions of each round that are easy and hard; the rest are medium.",
     "corpus.short_share": "Fraction of each round that is a short exercise; the rest are long.",
     "corpus.axis_weights": "How the four judge axes combine into one number when ranking answers.",

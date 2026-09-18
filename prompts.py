@@ -92,27 +92,10 @@ QUESTION_USER = """Write {n} Python exercises.
 Mix of difficulty: about {easy} easy, {medium} medium, {hard} hard.
 Mix of size: about {short} short and {long} long.
 Spread them across different topics - do not write several exercises on the same topic.
-
-{avoid}
+Reach for something you would not think of first: an unusual domain, an awkward constraint, a shape of
+problem that is not the textbook one.
 
 Output the JSON array now."""
-
-AVOID_NONE = "This is the first set, so any topic is fair game."
-
-AVOID_SOME = """These exercises already exist. Do NOT repeat any of them, do not rephrase them, and do not
-write a near-duplicate - the same algorithm with different names, or the same idea wearing a different
-story, both count as duplicates. Read them, then deliberately pick different topics and different shapes of
-problem.
-
-# Already written, in full
-
-{exercises}
-
-# Also already written (titles only)
-
-{titles}
-
-Now write exercises that are genuinely new next to all of the above."""
 
 
 # ---------------------------------------------------------------- the solvers
@@ -350,7 +333,7 @@ type hints, docstrings, and explicit handling of edge cases, using only the stan
 SOLVERS = [{"name": k, "prompt": v} for k, v in SOLVER_PERSONAS.items()]
 JUDGES = [{"name": k, "prompt": v} for k, v in JUDGE_PERSONAS.items()]
 
-_TEXT = ("question_system", "question_user", "avoid_none", "avoid_some", "solver_base", "solver_user",
+_TEXT = ("question_system", "question_user", "solver_base", "solver_user",
          "judge_base", "judge_user", "judge_answer_block", "lint_summary_system", "lint_summary_user",
          "refine_system", "refine_user", "bench_system", "bench_user_func", "bench_user_stdin",
          "bench_complete_stub", "probe_system", "probe_user", "sft_system")

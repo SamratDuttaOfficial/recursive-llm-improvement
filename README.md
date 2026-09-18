@@ -101,11 +101,17 @@ python pipeline.py --cycles 2
 **The exercises.** The model is asked for a JSON array of Python exercises with a difficulty and size mix,
 each with the exact signature to implement, worked examples, and a list of what a correct answer must get
 right. Nothing may need more than **20,000 tokens** of answer - a short one takes a few hundred, a long one
-a few thousand. The previous questionnaire goes back into the prompt **in full**: the 60 most recent
-exercises verbatim (`--recall-full`) within a 60k-character budget (`--recall-chars`), anything older
-degrading to its title, with an instruction not to repeat, rephrase or near-duplicate any of it. When a
-round is finished the script asks whether to generate the next set (`--new` answers yes without asking,
-`--no-new` only finishes what is pending).
+a few thousand. A round is filled **a batch at a time** (`--question-batch 6`) rather than in one call:
+asked for two dozen JSON objects at once a 0.8B model writes a handful and closes the array, and a set that
+does comply overruns the token ceiling and is cut off mid-object - either way the round ends far short.
+
+Variety comes from **sampling, not from recall**. Nothing the model has already written goes back into its
+context; it is simply run hot - `question_temp 1.25`, `top_k 120`, `top_p 0.98`, `min_p 0.02`, all in
+`config.json` - and every batch is an independent draw. The only thing carried across is the set of titles
+already used, which is enforced here rather than argued about in the prompt. Turn the temperature up for
+stranger exercises, down if the JSON starts coming back malformed. When a round is finished the script asks
+whether to generate the next set (`--new` answers yes without asking, `--no-new` only finishes what is
+pending).
 
 **Three answers.** Three solvers run concurrently on the same model with different sampling and different
 strengths - `careful` (temperature 0.25, edge cases first), `efficient` (0.7, complexity first) and
@@ -296,7 +302,8 @@ scripts also take `--config PATH`, `--print-config` and `--init-config`.
 **`run.py`** `--generator base|latest|v2` who answers (judges stay on base) - `--questions 24` per round -
 `--rounds 3` rounds in one go - `--new` / `--no-new` - `--workers N` - `--slots N` -
 `--answer-tokens 20000` the ceiling for one answer - `--judge-weight 0.7` judges against checker -
-`--recall-full 60` / `--recall-chars 60000` how much of the previous questionnaire is shown -
+`--question-batch 6` exercises per generation call - `--question-temp 1.25` / `--question-top-k 120` /
+`--question-top-p` / `--question-min-p` how adventurous the exercise writer is -
 `--no-exec` lint without running - `--run name` a separate experiment - `-v`
 
 **`finetune.py`** `--rounds 1,2` which corpus rounds - `--from-model base|latest|v1` retrain from base or
