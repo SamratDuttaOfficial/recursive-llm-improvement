@@ -1,0 +1,610 @@
+// RecursiveLLMImprovement - the one file that decides what the loop does.
+//
+// Comments (// and #) and trailing commas are allowed, and any long piece of text may be
+// written as a list of lines. A command-line flag overrides whatever is set here.
+// Delete this file and re-run to get a fresh copy of the defaults.
+{
+  // The one language the loop works in. Qwen's code training is overwhelmingly Python and
+  // every coding benchmark its authors report is Python, so that is where it has something
+  // to improve on. Changing this alone does not translate the prompts - edit those too.
+  "language": "Python",
+
+  // Which weights everything runs on. `base` is an Ollama name and is pulled automatically the
+  // first time it is needed, so putting a different model here is all that is required to
+  // switch. `generator` is who writes the questions and the answers (base | latest | v2 | a
+  // path to a .gguf); `judge` is deliberately kept on the untouched base model, which is what
+  // makes each round's scores comparable to the last. `hf_repo` is only needed for training -
+  // leave it empty and the candidates below are tried in order.
+  "model": {
+    "base": "qwen3.5:0.8b",
+    "generator": "base",
+    "judge": "base",
+    "hf_repo": "",
+    "hf_candidates": ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Instruct", "Qwen/Qwen3-0.6B"]
+  },
+
+  // How much runs at once. 0 means: measure the GPU and decide. `workers` is exercises in
+  // flight, `slots` is llama-server's parallel decoding slots, `backend` is auto | llama |
+  // ollama. Every solver and every judge of one exercise already runs concurrently.
+  "parallel": {
+    "workers": 0,
+    "slots": 0,
+    "max_slots": 32,
+    "backend": "auto"
+  },
+
+  // Phase 1 (run.py). `answer_tokens` is the ceiling for one answer - the judges read all of
+  // them whole, never truncated, so this also decides how big the judge context has to be.
+  // `judge_weight` splits the winner decision between the judges and the programmatic
+  // checker (1 = judges alone, 0 = checker alone). `recall_full` / `recall_chars` decide how
+  // much of the previous questionnaire is shown when writing the next one.
+  "corpus": {
+    "questions_per_round": 24,
+    "rounds": 1,
+    "answer_tokens": 20000,
+    "judge_tokens": 3000,
+    "question_tokens": 4000,
+    "summary_tokens": 700,
+    "question_temp": 1.0,
+    "refine_temp": 0.35,
+    "judge_weight": 0.7,
+    "min_score": 55,
+    "recall_full": 60,
+    "recall_chars": 60000,
+    "exec_timeout": 25,
+    "run_code": true,
+    "ctx": 0,
+
+    // Fractions of each round that are easy and hard; the rest are medium.
+    "difficulty_mix": {
+      "easy": 0.3,
+      "hard": 0.25
+    },
+
+    // Fraction of each round that is a short exercise; the rest are long.
+    "short_share": 0.6,
+
+    // How the four judge axes combine into one number when ranking answers.
+    "axis_weights": {
+      "correctness": 0.45,
+      "robustness": 0.2,
+      "efficiency": 0.15,
+      "style": 0.2
+    }
+  },
+
+  // The agents that answer each exercise, one entry each - add or remove entries to change
+  // how many there are. They all run on the same model and differ only in their sampling
+  // and in the `prompt` below, which is appended to the shared solver instructions.
+  "solvers": [
+    {
+      "name": "careful",
+      "temperature": 0.25,
+      "top_k": 20,
+      "top_p": 0.85,
+      "min_p": 0.05,
+      "prompt": [
+        "Your particular strength: correctness on edge cases. Before writing, think about the empty",
+        "input, the single-element input, duplicates, negative numbers, the largest allowed input, and inputs that",
+        "break the obvious assumption - and make sure the code handles each one. Prefer the straightforward",
+        "implementation that is obviously right over a clever one."
+      ]
+    },
+    {
+      "name": "efficient",
+      "temperature": 0.7,
+      "top_k": 50,
+      "top_p": 0.95,
+      "min_p": 0.02,
+      "prompt": [
+        "Your particular strength: complexity. Choose the data structure that gives the best",
+        "practical time and space for the stated constraints, say what that complexity is in the opening paragraph,",
+        "and avoid quadratic work where a linear or n log n approach exists. Never trade correctness for speed, and",
+        "never micro-optimise at the cost of readability."
+      ]
+    },
+    {
+      "name": "pythonic",
+      "temperature": 1.0,
+      "top_k": 80,
+      "top_p": 0.98,
+      "min_p": 0.0,
+      "prompt": [
+        "Your particular strength: idiomatic Python. Use the standard library where it already",
+        "solves the problem (itertools, collections, functools, dataclasses, heapq, bisect, re, enum), comprehensions",
+        "and generators where they read better than loops, context managers for resources, and clear names. Avoid",
+        "re-implementing something the standard library already does."
+      ]
+    }
+  ],
+
+  // The agents that score the answers. Same model again, different sampling, different bias.
+  // Each judge sees every answer in full and in its own order, so position cannot decide the
+  // winner. Add or remove entries to change how many judges there are.
+  "judges": [
+    {
+      "name": "bug-hunter",
+      "temperature": 0.1,
+      "top_k": 15,
+      "top_p": 0.8,
+      "prompt": [
+        "Your bias as a reviewer: you look for bugs first. Trace each answer on the exercise's own",
+        "examples and on the nastiest input the constraints allow. Off-by-one errors, mutation of the caller's data,",
+        "integer division, sorting stability, the empty case and the single-element case are where you start."
+      ]
+    },
+    {
+      "name": "architect",
+      "temperature": 0.45,
+      "top_k": 40,
+      "top_p": 0.92,
+      "prompt": [
+        "Your bias as a reviewer: you look at structure and interface first. Does it implement the",
+        "signature the exercise asked for, exactly? Is the decomposition sensible, are the names honest, do the",
+        "docstrings describe the real behaviour, is the error handling a deliberate design or an afterthought?"
+      ]
+    },
+    {
+      "name": "pragmatist",
+      "temperature": 0.75,
+      "top_k": 60,
+      "top_p": 0.96,
+      "prompt": [
+        "Your bias as a reviewer: you ask what happens when this code meets real data. Complexity",
+        "on the largest allowed input, memory use, needless passes over the data, and whether the answer would be",
+        "maintainable by someone who did not write it. You are unimpressed by cleverness that saves two lines."
+      ]
+    }
+  ],
+
+  // The programmatic check every answer goes through: compile, an AST pass, ruff, and an
+  // actual run of the code. `penalties` and `bonuses` are points off and on a 0-100 score.
+  "checker": {
+    "ruff_rules": "E,F,W,B,C4,UP,SIM,RET,ARG,PIE",
+    "ruff_ignore": "W291,W292,W293",
+    "penalties": {
+      "error": 34,
+      "warning": 4,
+      "info": 1,
+      "timeout": 25,
+      "import_error": 30,
+      "doctest_failure": 8,
+      "test_failure": 10,
+      "examples_fail": 22
+    },
+    "bonuses": {
+      "has_tests": 4,
+      "has_type_hints": 2
+    }
+  },
+
+  // Phase 2 (finetune.py). `from_model` is `base` for a clean run from the untouched model
+  // on the whole corpus, or `latest`/`v1` to keep training that version's own weights on
+  // the rounds it has not seen yet.
+  "finetune": {
+    "from_model": "base",
+    "epochs": 3.0,
+    "batch": 1,
+    "accum": 16,
+    "seq_len": 2048,
+    "lr": 0.0001,
+    "rank": 32,
+    "alpha": 64,
+    "save_steps": 25,
+    "min_score": 60,
+    "min_examples": 20,
+    "load_4bit": false,
+    "force_torch": false,
+    "gguf": true
+  },
+
+  // Phase 3 (benchmark.py). `use` picks from `catalog` below; anything named there is
+  // downloaded on first use. `probe` is the memorization screen - every problem is shown
+  // half-finished to the base model, and one it can reproduce verbatim is flagged, so
+  // every score is reported twice: over all problems, and over the unseen ones only.
+  "benchmarks": {
+    "use": ["lbpp", "evoeval"],
+    "solve_tokens": 2200,
+    "temp": 0.0,
+    "test_timeout": 30,
+    "limit": 0,
+    "self_check": true,
+    "probe": {
+      "enabled": true,
+      "tokens": 320,
+      "overlap": 0.45,
+      "run": 28
+    },
+
+    // Every benchmark this project knows how to fetch and run. To add one, copy the
+    // closest entry and change `source` and `fields`.
+    //   style    lbpp | evalplus | mbpp | lcb - how a downloaded row becomes a problem
+    //   harness  lbpp | evalplus | lcb - how a candidate answer is executed
+    //   source   kind hf-parquet | hf-jsonl | url-jsonl | url-parquet, plus repo/path
+    //            (`{split}` in a repo name expands over `splits`)
+    //   packed   true when the dataset base64+zlib encodes its fields
+    //   fields   which column of the download holds each part of a problem
+    "catalog": {
+      "lbpp": {
+        "style": "lbpp",
+        "harness": "lbpp",
+        "packed": true,
+        "source": {
+          "kind": "hf-parquet",
+          "repo": "CohereLabs/lbpp",
+          "path": "python/test.parquet"
+        },
+        "fields": {
+          "task_id": "task_id",
+          "title": "title",
+          "prompt": "instruction",
+          "signature": "signature",
+          "test_file": "test_file",
+          "test_setup": "test_setup",
+          "test_list": "test_list",
+          "reference": "completion"
+        },
+        "note": "Less Basic Python Problems (Cohere, 162). Published with every field zlib+base64 encoded so crawlers never ingest it as plain text. Harder than HumanEval."
+      },
+      "evoeval": {
+        "style": "evalplus",
+        "harness": "evalplus",
+        "source": {
+          "kind": "hf-jsonl",
+          "repo": "evoeval/EvoEval_{split}",
+          "path": "test.jsonl",
+          "splits": ["subtle", "creative"],
+          "all_splits": ["subtle", "creative", "difficult", "combine", "tool_use"]
+        },
+        "fields": {
+          "task_id": "task_id",
+          "prompt": "prompt",
+          "entry_point": "entry_point",
+          "test": "test",
+          "reference": "canonical_solution"
+        },
+        "reference_join": true,
+        "note": "Every HumanEval task rewritten so the memorised HumanEval answer is the wrong one. Same difficulty as HumanEval, but nothing can be answered from memory."
+      },
+      "humanevalplus": {
+        "style": "evalplus",
+        "harness": "evalplus",
+        "source": {
+          "kind": "hf-parquet",
+          "repo": "evalplus/humanevalplus",
+          "path": "data/test-00000-of-00001-5973903632b82d40.parquet"
+        },
+        "fields": {
+          "task_id": "task_id",
+          "prompt": "prompt",
+          "entry_point": "entry_point",
+          "test": "test",
+          "reference": "canonical_solution"
+        },
+        "reference_join": true,
+        "note": "Public since 2021, so contaminated for any recent model. Off by default."
+      },
+      "mbppplus": {
+        "style": "mbpp",
+        "harness": "evalplus",
+        "source": {
+          "kind": "hf-parquet",
+          "repo": "evalplus/mbppplus",
+          "path": "data/test-00000-of-00001-d5781c9c51e02795.parquet"
+        },
+        "fields": {
+          "task_id": "task_id",
+          "prompt": "prompt",
+          "entry_point": "entry_point",
+          "test": "test",
+          "test_list": "test_list",
+          "reference": "code"
+        },
+        "id_prefix": "Mbpp/",
+        "note": "Public since 2021, so contaminated for any recent model. Off by default."
+      },
+      "lcb": {
+        "style": "lcb",
+        "harness": "lcb",
+        "packed": true,
+        "self_check": false,
+        "source": {
+          "kind": "hf-jsonl",
+          "repo": "livecodebench/code_generation_lite",
+          "paths": ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"]
+        },
+        "newest": 150,
+        "after": "2024-08-01",
+        "max_tests": 18,
+        "warn": "LiveCodeBench ships its test cases inline: the download is several GB, and competitive-programming problems are far above a 0.8B model."
+      }
+    }
+  },
+
+  // The live dashboard each phase serves on 127.0.0.1.
+  "ui": {
+    "dashboard": true,
+    "open_browser": true,
+    "report_every": 60,
+    "ports": {
+      "corpus": 8777,
+      "finetune": 8778,
+      "benchmark": 8779
+    }
+  },
+
+  // Where the model servers listen. Only worth changing if something else owns these ports.
+  "server": {
+    "port_corpus": 11500,
+    "port_benchmark": 11600
+  },
+
+  // Every prompt, in full. `{...}` markers are filled in by the code and must stay; anything
+  // else is yours to rewrite. In the judge prompts `{count}`, `{slots}`, `{schema}` and
+  // `{best_slots}` expand to match however many judges and solvers are configured above.
+  "prompts": {
+    "question_system": [
+      "You write programming exercises for a Python benchmark. You are precise and terse.",
+      "",
+      "Every exercise must:",
+      "- be solvable in pure Python 3.10+ using only the standard library",
+      "- be completely self-contained: all inputs, constraints and expected behaviour stated in the question itself",
+      "- have an objectively checkable answer (a function with a stated signature, or a small program)",
+      "- be answerable in at most {budget} tokens of code and explanation - a short one in a few",
+      "  hundred, a long one in a few thousand, but never more than that ceiling",
+      "- avoid anything needing the internet, a database, a GPU, a GUI, or a third-party package",
+      "",
+      "You never write the solution. You only write the exercise.",
+      "",
+      "Answer with a JSON array and nothing else - no prose before it, no code fence around it.",
+      "Each element is an object with exactly these keys:",
+      "  \"title\":       3-8 words, lowercase, hyphenated, unique",
+      "  \"difficulty\":  \"easy\" | \"medium\" | \"hard\"",
+      "  \"size\":        \"short\" (a single function, ~20-60 lines) | \"long\" (several cooperating functions, a",
+      "                 class or a small module, ~100-400 lines - big enough to be a real piece of work)",
+      "  \"topic\":       one of: algorithms, data-structures, strings, parsing, math, recursion, dynamic-programming,",
+      "                 iterators-generators, decorators, classes-oop, error-handling, file-formats, concurrency,",
+      "                 dates-times, regex, functional, caching, state-machines, numerical, text-processing",
+      "  \"question\":    the exercise itself, 60-250 words, with the exact function or class signature to implement,",
+      "                 the input constraints, and at least two worked input/output examples",
+      "  \"checks\":      2-5 short sentences naming what a correct solution must get right (edge cases, complexity,",
+      "                 error behaviour). These are hints for graders, not part of the question text.",
+      "",
+      "Example of one element (follow this shape exactly):",
+      "{\"title\": \"merge-overlapping-intervals\", \"difficulty\": \"medium\", \"size\": \"short\", \"topic\": \"algorithms\",",
+      " \"question\": \"Implement `merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]`. Each tuple is a closed interval (start, end) with start <= end. Return the intervals merged so that no two overlap or touch, sorted by start. The input may be unsorted and may be empty. Intervals that merely touch, such as (1, 2) and (2, 5), count as overlapping and must merge into (1, 5). Example: merge_intervals([(5, 7), (1, 3), (2, 4)]) returns [(1, 4), (5, 7)]. Example: merge_intervals([]) returns [].\",",
+      " \"checks\": [\"Sorts before merging rather than assuming order.\", \"Treats touching intervals as overlapping.\", \"Returns a new list and does not mutate the input.\", \"Runs in O(n log n).\"]}",
+      "",
+      "Output: a JSON array of exercise objects. Nothing else."
+    ],
+    "question_user": [
+      "Write {n} Python exercises.",
+      "",
+      "Mix of difficulty: about {easy} easy, {medium} medium, {hard} hard.",
+      "Mix of size: about {short} short and {long} long.",
+      "Spread them across different topics - do not write several exercises on the same topic.",
+      "",
+      "{avoid}",
+      "",
+      "Output the JSON array now."
+    ],
+    "avoid_none": "This is the first set, so any topic is fair game.",
+    "avoid_some": [
+      "These exercises already exist. Do NOT repeat any of them, do not rephrase them, and do not",
+      "write a near-duplicate - the same algorithm with different names, or the same idea wearing a different",
+      "story, both count as duplicates. Read them, then deliberately pick different topics and different shapes of",
+      "problem.",
+      "",
+      "# Already written, in full",
+      "",
+      "{exercises}",
+      "",
+      "# Also already written (titles only)",
+      "",
+      "{titles}",
+      "",
+      "Now write exercises that are genuinely new next to all of the above."
+    ],
+    "solver_base": [
+      "You are an expert Python engineer. You write correct, readable, idiomatic Python 3.10+.",
+      "",
+      "How to answer, every time:",
+      "1. One short paragraph (2-4 sentences) on the approach and its complexity. No headings, no bullet lists.",
+      "2. Exactly one ```python code block with the complete solution. It must be the whole file: every import at",
+      "   the top, the required signature exactly as the question states it, type hints, and a docstring on each",
+      "   public function that says what it returns and how it handles the edge cases.",
+      "3. After the code block, a few short `assert` examples inside a second ```python block that demonstrate the",
+      "   stated examples and at least one edge case.",
+      "",
+      "Hard rules:",
+      "- Standard library only. Never import a third-party package.",
+      "- The code must run as written: no placeholders, no `...`, no `TODO`, no functions you never define.",
+      "- Handle the edge cases the question names (empty input, single element, invalid input) explicitly.",
+      "- Raise a specific exception (ValueError, TypeError) with a clear message for invalid input; never return None",
+      "  to signal an error.",
+      "- Do not print anything from library functions; return values.",
+      "- You have up to {budget} tokens. Use what the exercise needs and no more: a short exercise",
+      "  deserves a short answer. If you do approach the limit, shorten the prose, never the code -",
+      "  an answer that stops in the middle of a function counts as a failure.",
+      "",
+      ""
+    ],
+    "solver_user": [
+      "Solve this exercise.",
+      "",
+      "{question}",
+      "",
+      "A correct solution must get these right:",
+      "{checks}",
+      "",
+      "Write your answer now: the short paragraph, then the ```python solution block, then the ```python assert block."
+    ],
+    "judge_base": [
+      "You are a strict Python code reviewer scoring candidate solutions to the same exercise.",
+      "",
+      "You see the exercise and {count} candidate answers, {slots}. Score each one honestly and independently -",
+      "they are often all flawed, and giving everything a 7 is a failure of your job. Use the whole scale:",
+      "  9-10  correct, handles every edge case, clean and idiomatic - you would merge it as is",
+      "  7-8   correct for the main cases, minor issues (a missed edge case, a clumsy name, a weak docstring)",
+      "  5-6   the approach is right but there is a real bug, a missing case, or the wrong complexity",
+      "  3-4   partly relevant but broken: it would fail on the stated examples",
+      "  1-2   does not solve the exercise, does not run, or ignores the required signature",
+      "",
+      "Score each answer on four axes, each 1-10:",
+      "  \"correctness\"  - does it actually compute the right result, including the edge cases named in the exercise?",
+      "  \"robustness\"   - invalid input, error handling, no crashes, no silent wrong answers",
+      "  \"efficiency\"   - the complexity the constraints call for, no needless work",
+      "  \"style\"        - readability, naming, docstrings, type hints, idiomatic use of the standard library",
+      "Then give \"overall\", 1-10, which is your judgement of the answer as a whole, not an average.",
+      "",
+      "You have no internet and no interpreter. Read the code line by line and trace it on the examples in the",
+      "exercise. If you are not sure whether something is a bug, say so in \"doubts\" instead of asserting it.",
+      "",
+      "Reply with ONE JSON object and nothing else - no prose, no code fence. Exactly this shape:",
+      "",
+      "{\"answers\": {",
+      "{schema}},",
+      " \"best\": \"{first}\",",
+      " \"why_best\": \"one sentence comparing the winner to the others\",",
+      " \"fix_list\": [\"the single most important change the winning answer needs\",",
+      "              \"the next most important\", \"the next\"]}",
+      "",
+      "Rules for the content:",
+      "- \"good\", \"bad\" and \"doubts\" are lists of short, concrete sentences. Never write \"good code\" or \"has bugs\":",
+      "  name the function, the input, the line, the case that breaks.",
+      "- \"fix_list\" is about the winning answer only, ordered by importance, at most 5 items, each an instruction",
+      "  that can be acted on directly (\"guard against an empty list in merge(), which currently raises IndexError\").",
+      "- \"best\" must be exactly {best_slots}.",
+      "- Every key above must be present. Output the JSON object only."
+    ],
+    "judge_user": [
+      "# Exercise",
+      "",
+      "{question}",
+      "",
+      "A correct solution must get these right:",
+      "{checks}",
+      "",
+      "{answers}",
+      "",
+      "Score all {count} now. Output the single JSON object described in your instructions, and nothing else."
+    ],
+    "judge_answer_block": [
+      "# Answer {slot}",
+      "",
+      "{text}"
+    ],
+    "lint_summary_system": [
+      "You turn the output of Python static analysis and a test run into a short briefing",
+      "for the engineer who will fix the code.",
+      "",
+      "Rules:",
+      "- At most 8 bullet points, ordered by how much each one matters. Real errors first, then things that would",
+      "  bite in production, then style.",
+      "- Each bullet: what is wrong, where (function or line), and what to do about it. One sentence.",
+      "- Merge findings that are the same underlying mistake into one bullet (\"six unused imports: drop them\").",
+      "- Ignore pure noise. If a finding is a false positive given what the code is doing, leave it out.",
+      "- If there is nothing worth fixing, reply with exactly: NOTHING TO FIX",
+      "- No preamble, no closing remark, no headings. Just the bullets."
+    ],
+    "lint_summary_user": [
+      "The code under review:",
+      "",
+      "```python",
+      "{code}",
+      "```",
+      "",
+      "Raw findings from the checker (ruff, an AST pass, and an actual run of the file):",
+      "",
+      "{report}",
+      "",
+      "Write the briefing now."
+    ],
+    "refine_system": [
+      "You are an expert Python engineer rewriting your own solution after review.",
+      "",
+      "You are given the exercise, your best attempt, what the independent reviewers said about it, and the",
+      "findings of a static checker that also ran the code. Produce the corrected solution.",
+      "",
+      "How to answer:",
+      "1. One short paragraph (2-4 sentences): what was actually wrong and what you changed. Be specific.",
+      "2. Exactly one ```python code block with the complete corrected file - every import, the exact required",
+      "   signature, type hints, docstrings. Not a diff, not a fragment: the whole thing, ready to run.",
+      "3. A second ```python block of `assert` examples covering the stated examples plus the edge cases the",
+      "   reviewers raised.",
+      "",
+      "Hard rules:",
+      "- Fix every item in the fix list and every error the checker found, unless an item is plainly wrong - in",
+      "  that case say so in one clause in the opening paragraph and move on.",
+      "- Do not regress: keep everything the reviewers said was good about the answer.",
+      "- Standard library only. The code must run exactly as written.",
+      "- Do not apologise, do not narrate the review, do not repeat the reviewers' text back.",
+      "- You have up to {budget} tokens; never stop in the middle of the code block."
+    ],
+    "refine_user": [
+      "# Exercise",
+      "",
+      "{question}",
+      "",
+      "A correct solution must get these right:",
+      "{checks}",
+      "",
+      "# The answer being corrected (it was judged the best of {count})",
+      "",
+      "{answer}",
+      "",
+      "# What the reviewers said",
+      "",
+      "{critique}",
+      "",
+      "# What the static checker and the test run found",
+      "",
+      "{lint}",
+      "",
+      "Rewrite the solution now: the short paragraph, then the complete ```python solution, then the ```python asserts."
+    ],
+    "bench_system": [
+      "You are an expert Python programmer. Solve the problem exactly as specified.",
+      "",
+      "Reply with exactly one ```python code block and nothing else - no explanation before or after it.",
+      "The block must contain the complete, runnable solution: every import at the top, and the exact function",
+      "signature or program structure the problem asks for. Prefer the standard library; use numpy or pandas only",
+      "when the problem itself asks for them. No placeholders."
+    ],
+    "bench_user_func": [
+      "{prompt}",
+      "",
+      "{signature_note}Write the complete solution in one ```python block now."
+    ],
+    "bench_user_stdin": [
+      "{prompt}",
+      "",
+      "Read the input from standard input and write the answer to standard output, exactly in the format described.",
+      "Write the complete program in one ```python block now."
+    ],
+    "bench_complete_stub": [
+      "Complete this function. Keep the signature exactly as given and include it in your answer:",
+      "",
+      "```python",
+      "{stub}",
+      "```"
+    ],
+    "probe_system": [
+      "You are completing a text you have seen before. Reproduce the continuation exactly as it",
+      "was written, word for word. If you do not recognise the text, reply with exactly: UNKNOWN"
+    ],
+    "probe_user": [
+      "This is the first part of a programming problem statement from a public benchmark.",
+      "Continue it verbatim from where it stops. Do not solve it, do not explain, do not start a new sentence of",
+      "your own - only reproduce the rest of the original statement.",
+      "",
+      "--- first part ---",
+      "{first}",
+      "--- continue from here ---"
+    ],
+    "sft_system": [
+      "You are an expert Python engineer. You write correct, readable, idiomatic Python code with",
+      "type hints, docstrings, and explicit handling of edge cases, using only the standard library."
+    ]
+  }
+}

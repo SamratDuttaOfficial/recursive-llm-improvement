@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recursive Self-Improvement</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 2a6 6 0 1 0 5.2 3' fill='none' stroke='%232c6bdb' stroke-width='2'/%3E%3Cpath d='M13 1v4h-4' fill='none' stroke='%232c6bdb' stroke-width='2'/%3E%3C/svg%3E">
+<!--
+  One page for all three phases. run.py, finetune.py and benchmark.py each serve this file and a small
+  read-only JSON API on 127.0.0.1. Opened straight from disk it finds whichever phases are running by
+  probing their default ports.
+-->
+<style>
+:root {
+  --bg:#f3f4f6; --panel:#fff; --sunk:#f1f3f6; --line:#e2e5ea; --line2:#d0d5dc;
+  --text:#15181c; --muted:#5f6772; --faint:#98a0aa;
+  --accent:#2c6bdb; --accent-bg:#e7eefc;
+  --ok:#147a45; --ok-bg:#ddf3e6; --bad:#c0362c; --bad-bg:#fbe5e3; --warn:#a65d0a; --warn-bg:#fcefd9;
+  --k-answer:#6a48cc; --k-judge:#b3306f; --k-refine:#0d7f82; --k-questions:#2c6bdb; --k-solve:#2c6bdb;
+  --k-summary:#6b7380; --k-probe:#a65d0a; --k-call:#6b7380;
+  --shadow:0 1px 2px rgba(16,24,40,.06);
+  --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0e1014; --panel:#161920; --sunk:#1d2129; --line:#282d36; --line2:#373d49;
+  --text:#e5e7ea; --muted:#9ba3ae; --faint:#6b7380;
+  --accent:#6d9eff; --accent-bg:#1a2640;
+  --ok:#4fc58c; --ok-bg:#15301f; --bad:#ff7066; --bad-bg:#3b1c1a; --warn:#f1a54c; --warn-bg:#3a2912;
+  --k-answer:#8b6ff0; --k-judge:#d0508f; --k-refine:#17a0a0; --k-questions:#4c82ea; --k-solve:#4c82ea;
+  --k-probe:#f1a54c; --shadow:none; color-scheme:dark;
+}}
+:root[data-theme="dark"]{
+  --bg:#0e1014; --panel:#161920; --sunk:#1d2129; --line:#282d36; --line2:#373d49;
+  --text:#e5e7ea; --muted:#9ba3ae; --faint:#6b7380;
+  --accent:#6d9eff; --accent-bg:#1a2640;
+  --ok:#4fc58c; --ok-bg:#15301f; --bad:#ff7066; --bad-bg:#3b1c1a; --warn:#f1a54c; --warn-bg:#3a2912;
+  --k-answer:#8b6ff0; --k-judge:#d0508f; --k-refine:#17a0a0; --k-questions:#4c82ea; --k-solve:#4c82ea;
+  --k-probe:#f1a54c; --shadow:none; color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.45 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+code,pre{font-family:var(--mono)}
+h2{font-size:15px;margin:24px 0 10px}
+h3{font-size:13px;margin:16px 0 7px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.muted{color:var(--muted)} .faint{color:var(--faint)} .small{font-size:12px}
+.ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+[hidden]{display:none!important}
+.chrome{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:12px;padding:9px 18px 0;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:9px;min-width:0;flex:1}
+.brand b{font-size:15px;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.dot.off{background:var(--bad);box-shadow:0 0 0 3px var(--bad-bg)}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:20px;background:var(--sunk);
+  color:var(--muted);font-size:11.5px;font-weight:600;white-space:nowrap}
+.chip.acc{background:var(--accent-bg);color:var(--accent)}
+.chip.ok{background:var(--ok-bg);color:var(--ok)}
+.chip.bad{background:var(--bad-bg);color:var(--bad)}
+.chip.warn{background:var(--warn-bg);color:var(--warn)}
+.tabs{display:flex;gap:2px;padding:4px 12px 0;overflow-x:auto;scrollbar-width:none}
+.tabs button{border:0;background:none;color:var(--muted);font:600 13px var(--sans);padding:8px 11px 9px;
+  border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap}
+.tabs button.on{color:var(--text);border-bottom-color:var(--accent)}
+.tabs button:hover{color:var(--text)}
+.count{display:inline-block;min-width:17px;padding:0 5px;margin-left:4px;border-radius:9px;background:var(--sunk);
+  color:var(--muted);font:600 10.5px/17px var(--sans);text-align:center}
+main{max-width:1500px;margin:0 auto;padding:16px 18px 60px}
+.btn{border:1px solid var(--line2);background:var(--panel);color:var(--text);font:600 12px var(--sans);
+  padding:4px 9px;border-radius:6px;cursor:pointer}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.sm{padding:2px 7px;font-size:11px}
+select,input{font:13px var(--sans);color:var(--text);background:var(--panel);border:1px solid var(--line2);
+  border-radius:6px;padding:4px 7px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 15px;box-shadow:var(--shadow);min-width:0}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(190px,100%),1fr));gap:10px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 13px;box-shadow:var(--shadow)}
+.k-label{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em}
+.k-value{font-size:23px;font-weight:660;margin-top:2px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.k-value small{font-size:12.5px;font-weight:500;color:var(--muted);margin-left:3px}
+.k-sub{color:var(--muted);font-size:11.5px;margin-top:1px}
+.kpi.good .k-value{color:var(--ok)} .kpi.bad .k-value{color:var(--bad)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(430px,100%),1fr));gap:12px}
+table{width:100%;border-collapse:collapse;font-size:12.8px}
+th{text-align:left;font-weight:600;color:var(--muted);padding:6px 8px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--panel);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em}
+td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+tr.click{cursor:pointer} tr.click:hover td{background:var(--sunk)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.bar-bg{height:6px;border-radius:3px;background:var(--sunk);overflow:hidden;min-width:60px}
+.bar-fg{height:100%;background:var(--accent);border-radius:3px;transition:width .3s}
+.bar-fg.ok{background:var(--ok)} .bar-fg.warn{background:var(--warn)} .bar-fg.bad{background:var(--bad)}
+.pipe{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px}
+.node{flex:1 0 128px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 11px;box-shadow:var(--shadow)}
+.node.hot{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg)}
+.n-name{font:660 12.5px var(--mono)} .n-desc{color:var(--muted);font-size:11px;min-height:30px;margin-top:2px}
+.n-now{font-size:12px;margin-top:4px;min-height:17px;color:var(--accent);font-weight:600}
+.live{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(410px,100%),1fr));gap:10px}
+.lc{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;box-shadow:var(--shadow);cursor:pointer}
+.lc:hover{border-color:var(--accent)}
+.lc-top{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:5px}
+.lc-tag{font:600 12px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lc-text{font:11.5px/1.4 var(--mono);color:var(--muted);background:var(--sunk);border-radius:6px;padding:7px 9px;
+  height:112px;overflow:hidden;white-space:pre-wrap;word-break:break-word;display:flex;flex-direction:column-reverse}
+pre.code{font:11.8px/1.5 var(--mono);background:var(--sunk);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;overflow:auto;max-height:460px;white-space:pre-wrap;word-break:break-word;margin:6px 0}
+.kind{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+.feed{font:12px/1.55 var(--mono);max-height:600px;overflow:auto}
+.feed div{padding:1px 0;border-bottom:1px solid var(--line)}
+.feed .t{color:var(--faint);margin-right:7px}
+.feed .k{display:inline-block;min-width:78px;color:var(--muted)}
+dialog{border:1px solid var(--line2);border-radius:12px;background:var(--panel);color:var(--text);
+  max-width:1080px;width:94vw;max-height:90vh;padding:0;box-shadow:0 12px 40px rgba(0,0,0,.28)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+.dlg-head{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--panel);z-index:2}
+.dlg-body{padding:14px 16px;overflow:auto;max-height:calc(90vh - 56px)}
+.seg{display:inline-flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden;flex-wrap:wrap}
+.seg button{border:0;background:var(--panel);color:var(--muted);font:600 12px var(--sans);padding:4px 10px;
+  cursor:pointer;border-right:1px solid var(--line)}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--accent-bg);color:var(--accent)}
+.offline{margin:12px 0;padding:11px 14px;border-radius:9px;background:var(--warn-bg);border:1px solid var(--warn);
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.axes{display:grid;grid-template-columns:auto 1fr auto;gap:3px 8px;align-items:center;font-size:12px}
+.note{margin:3px 0 3px 15px;font-size:12.3px}
+.note.g::marker{color:var(--ok)} .note.b::marker{color:var(--bad)}
+svg.chart{width:100%;height:190px;display:block}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:4px}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+</style>
+</head>
+<body>
+<div class="chrome">
+  <div class="bar">
+    <div class="brand">
+      <span class="dot" id="dot"></span>
+      <b>Recursive self-improvement</b>
+      <span class="chip acc" id="phaseChip">idle</span>
+      <span class="muted small" id="subtitle"></span>
+    </div>
+    <span class="chip" id="gpuChip" hidden></span>
+    <span class="chip" id="tokChip" hidden></span>
+    <span class="chip" id="elapsedChip"></span>
+    <select id="endpoint" title="which phase to watch"></select>
+    <button class="btn sm" id="theme">theme</button>
+  </div>
+  <div class="tabs" id="tabs"></div>
+</div>
+<main>
+  <div class="offline" id="offline" hidden>
+    <b>Not connected.</b>
+    <span class="small">Start a phase - <code>python run.py</code>, <code>python finetune.py</code> or
+    <code>python benchmark.py</code> - and this page will pick it up.</span>
+    <button class="btn sm" id="retry">retry now</button>
+  </div>
+  <section id="v-overview"></section>
+  <section id="v-live" hidden></section>
+  <section id="v-corpus" hidden></section>
+  <section id="v-training" hidden></section>
+  <section id="v-benchmark" hidden></section>
+  <section id="v-events" hidden></section>
+</main>
+
+<dialog id="modal"><div class="dlg-head"><b id="mTitle"></b><span class="muted small" id="mSub"></span>
+  <span style="flex:1"></span><button class="btn sm" onclick="modal.close()">close</button></div>
+  <div class="dlg-body" id="mBody"></div></dialog>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s), el = (t, c, h) => { const n = document.createElement(t);
+  if (c) n.className = c; if (h !== undefined) n.innerHTML = h; return n; };
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtT = s => { s = Math.max(0, Math.round(s)); return s < 60 ? s + "s" : s < 3600 ?
+  Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s" :
+  Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m"; };
+const nn = (v, d) => (v === null || v === undefined || Number.isNaN(v)) ? (d === undefined ? "-" : d) : v;
+const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+
+/* ---------------------------------------------------------------- endpoints */
+const PORTS = [8777, 8778, 8779, 8780, 8781];
+const here = location.protocol.startsWith("http") ? location.origin : null;
+let endpoints = [], base = here, state = null, lastSeq = 0, events = [], tab = "overview", failures = 0;
+
+async function jget(url, ms = 8000) {
+  const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
+  try { const r = await fetch(url, { signal: c.signal, cache: "no-store" });
+        if (!r.ok) throw new Error(r.status); return await r.json(); }
+  finally { clearTimeout(t); }
+}
+async function discover() {
+  const found = [];
+  const cands = here ? [here, ...PORTS.map(p => "http://127.0.0.1:" + p)] : PORTS.map(p => "http://127.0.0.1:" + p);
+  await Promise.all([...new Set(cands)].map(async u => {
+    try { const s = await jget(u + "/api/state", 2500); found.push({ url: u, kind: s.kind || "?", run: s.run || "" }); }
+    catch (e) {}
+  }));
+  found.sort((a, b) => ["corpus", "finetune", "benchmark"].indexOf(a.kind) - ["corpus", "finetune", "benchmark"].indexOf(b.kind));
+  endpoints = found;
+  const sel = $("#endpoint");
+  sel.innerHTML = found.map(f => `<option value="${esc(f.url)}">${esc(f.kind)}${f.run ? " / " + esc(f.run) : ""}</option>`).join("");
+  sel.hidden = found.length < 2;
+  if (!found.some(f => f.url === base)) base = found.length ? found[0].url : null;
+  if (base) sel.value = base;
+}
+$("#endpoint").onchange = e => { base = e.target.value; lastSeq = 0; events = []; tick(true); };
+$("#retry").onclick = () => discover().then(() => tick(true));
+
+/* ---------------------------------------------------------------- tabs */
+const TABS = {
+  overview:  { label: "Overview",  when: () => true },
+  live:      { label: "Live",      when: () => true },
+  corpus:    { label: "Corpus",    when: s => s && s.kind === "corpus" },
+  training:  { label: "Training",  when: s => s && s.kind === "finetune" },
+  benchmark: { label: "Benchmark", when: s => s && s.kind === "benchmark" },
+  events:    { label: "Events",    when: () => true },
+};
+function drawTabs() {
+  const box = $("#tabs"); const want = Object.keys(TABS).filter(k => TABS[k].when(state));
+  if (!want.includes(tab)) tab = "overview";
+  box.innerHTML = "";
+  want.forEach(k => {
+    const b = el("button", tab === k ? "on" : "", TABS[k].label +
+      (k === "live" && liveCalls.length ? `<span class="count">${liveCalls.length}</span>` : ""));
+    b.onclick = () => { tab = k; drawTabs(); show(); };
+    box.appendChild(b);
+  });
+  Object.keys(TABS).forEach(k => { const s = $("#v-" + k); if (s) s.hidden = k !== tab; });
+}
+function show() { if (!state) return; ({ overview: drawOverview, live: drawLive, corpus: drawCorpus,
+  training: drawTraining, benchmark: drawBenchmark, events: drawEvents }[tab] || (() => {}))(); }
+
+/* ---------------------------------------------------------------- polling */
+let liveCalls = [], livePreview = {};
+async function tick(force) {
+  if (!base) { await discover(); if (!base) { setOffline(true); return; } }
+  try {
+    const [s, lv] = await Promise.all([jget(base + "/api/state"), jget(base + "/api/live").catch(() => null)]);
+    state = s; failures = 0; setOffline(false);
+    if (lv) { liveCalls = lv.calls || []; livePreview = lv.preview || {}; }
+    const ev = await jget(base + "/api/events?since=" + lastSeq).catch(() => null);
+    if (ev) { events = events.concat(ev.events || []).slice(-1200); lastSeq = ev.last || lastSeq; }
+    header(); drawTabs(); show();
+  } catch (e) {
+    if (++failures > 2) { setOffline(true); await discover(); }
+  }
+}
+function setOffline(off) { $("#offline").hidden = !off; $("#dot").className = "dot " + (off ? "off" : "on"); }
+
+function header() {
+  const s = state;
+  $("#phaseChip").textContent = (s.phase && s.phase.name ? s.phase.name : s.kind) +
+    (s.stopping ? " - stopping" : "");
+  $("#phaseChip").className = "chip " + (s.stopping ? "warn" : "acc");
+  $("#subtitle").textContent = [s.phase && s.phase.detail, s.run ? "run " + s.run : ""].filter(Boolean).join("  -  ");
+  $("#elapsedChip").textContent = fmtT(s.elapsed || 0);
+  const g = s.gpu, gc = $("#gpuChip");
+  gc.hidden = !g;
+  if (g) gc.textContent = (g.unified ? "unified " : "GPU ") + (g.util >= 0 ? g.util + "%  " : "") +
+    Math.round(g.used / 1024 * 10) / 10 + "/" + Math.round(g.total / 1024 * 10) / 10 + " GB";
+  const st = s.stats || {}, tc = $("#tokChip");
+  tc.hidden = !st.out;
+  if (st.out) tc.textContent = Math.round(st.out / 1000) + "k tok  -  " +
+    Math.round(st.out / Math.max(1, s.elapsed)) + " tok/s  -  " + (st.calls || 0) + " calls";
+  document.title = (s.kind || "run") + " - " + (s.phase && s.phase.name || "") + " - recursive self-improvement";
+}
+
+/* ---------------------------------------------------------------- overview */
+function kpi(label, value, sub, cls) {
+  return `<div class="kpi ${cls || ""}"><div class="k-label">${esc(label)}</div>
+    <div class="k-value">${value}</div><div class="k-sub">${sub || ""}</div></div>`;
+}
+/* The pipeline is drawn from the configuration, not from a fixed list: config.json decides how many
+   solvers and judges there are, so the diagram has to say whatever that file says. */
+function pipeNodes(cfg) {
+  const ns = (cfg.solvers || []).length || 3, nj = (cfg.judges || []).length || 3;
+  return [
+    ["questions", "the model writes the exercise set", /^questions/],
+    [ns + " answers", ns + " solvers, different sampling and strengths", /writing \d+ answers/],
+    ["checker", "compile + lint + actually run the code", /check/],
+    [nj + " judges", "each sees every answer, scores in JSON", /judges scoring/],
+    ["pick", "weighted scores and votes choose the winner", /verdict|pick/],
+    ["summarise", "the model condenses the checker findings", /summaris/],
+    ["rewrite", "winner + criticism + findings -&gt; final answer", /rewrit/],
+    ["corpus", "saved as a training pair", /corpus/],
+  ];
+}
+/* What is actually in effect right now, read straight from the config file the run was started with. */
+function configCard(s) {
+  const c = s.config || {}, rows = [];
+  const add = (k, v) => { if (v !== undefined && v !== null && v !== "") rows.push([k, v]); };
+  add("config file", c.config);
+  add("model", c.model);
+  if (s.kind === "corpus") {
+    add("generator / judges", (c.generator || "?") + "  /  " + (c.judge_model || "?"));
+    add("solvers", (c.solvers || []).map(x => x.name + " (t=" + x.temperature + ", top_k=" + x.top_k + ")").join(", "));
+    add("judges", (c.judges || []).map(x => x.name + " (t=" + x.temperature + ", top_k=" + x.top_k + ")").join(", "));
+    add("exercises per round", c.questions);
+    add("answer ceiling", c.answer_tokens + " tokens");
+    add("who picks the winner", "judges " + Math.round(c.judge_weight * 100) + "%, checker " +
+      Math.round((1 - c.judge_weight) * 100) + "%");
+    add("accept at", "checker score >= " + c.min_score);
+  } else if (s.kind === "finetune") {
+    add("from", c.from_model);
+    add("recipe", "LoRA r=" + c.rank + " alpha=" + c.alpha + ", " + c.epochs + " epochs, lr " + c.lr +
+      ", seq " + c.seq_len + ", batch " + c.batch + "x" + c.accum);
+    add("train on", "answers scoring >= " + c.min_score);
+  } else if (s.kind === "benchmark") {
+    add("benchmarks", (c.benchmarks || Object.keys(c.catalog || {}).join(", ")));
+    add("sampling", "temperature " + c.temp + ", up to " + c.solve_tokens + " tokens");
+    add("memorization probe", c.no_probe ? "off" : "on (overlap " + c.probe_overlap + ", run " + c.probe_run + ")");
+  }
+  if (!rows.length) return "";
+  return `<h2>Configuration <span class="muted small">edit config.json and re-run to change any of this</span></h2>
+    <div class="card"><table><tbody>` +
+    rows.map(([k, v]) => `<tr><td class="muted">${esc(k)}</td><td><code>${esc(String(v))}</code></td></tr>`).join("") +
+    `</tbody></table></div>`;
+}
+function drawOverview() {
+  const s = state, v = $("#v-overview");
+  let h = "";
+  if (s.kind === "corpus") {
+    const rounds = s.rounds || [], cur = rounds[rounds.length - 1] || {};
+    const done = rounds.reduce((a, r) => a + r.done, 0), tot = rounds.reduce((a, r) => a + r.total, 0);
+    const acc = rounds.reduce((a, r) => a + r.accepted, 0);
+    const withGain = rounds.filter(r => r.gain !== null && r.gain !== undefined);
+    const gain = withGain.length ? (withGain.reduce((a, r) => a + r.gain, 0) / withGain.length).toFixed(1) : null;
+    h += `<div class="kpis">
+      ${kpi("rounds", rounds.length, "current round " + (cur.n || "-"))}
+      ${kpi("exercises", done + "<small>/" + tot + "</small>", pct(done, tot) + "% of this run")}
+      ${kpi("accepted into corpus", acc, done ? pct(acc, done) + "% of finished" : "", "good")}
+      ${kpi("judge score", nn(cur.judge_score) + "<small>/10</small>", "mean for the winning answer")}
+      ${kpi("checker after rewrite", nn(cur.check_after) + "<small>/100</small>",
+            "before the rewrite: " + nn(cur.check_before))}
+      ${kpi("rewrite gain", (gain > 0 ? "+" : "") + nn(gain), "checker points per exercise",
+            gain > 0 ? "good" : (gain < 0 ? "bad" : ""))}
+    </div>`;
+    const active = s.active || {}, names = Object.keys(active);
+    const acts = Object.values(active).map(String).concat([(s.phase || {}).name || ""]);
+    h += `<h2>Pipeline <span class="muted small">${names.length} exercise(s) in flight</span></h2><div class="pipe">` +
+      pipeNodes(s.config || {}).map(([n, d, re]) => {
+        const on = acts.some(x => re.test(x));
+        return `<div class="node ${on ? "hot" : ""}"><div class="n-name">${esc(n)}</div>
+          <div class="n-desc">${d}</div></div>`;
+      }).join("") + `</div>`;
+    if (names.length) h += `<h3>in flight</h3><div class="card"><table><tbody>` +
+      names.map(q => `<tr><td><code>${esc(q)}</code></td><td class="muted">${esc(active[q])}</td></tr>`).join("") +
+      `</tbody></table></div>`;
+    h += `<h2>Rounds</h2><div class="card"><table><thead><tr><th>round</th><th>generator</th>
+      <th class="num">done</th><th class="num">accepted</th><th class="num">judge</th>
+      <th class="num">checker before</th><th class="num">after</th><th class="num">gain</th></tr></thead><tbody>` +
+      rounds.map(r => `<tr><td>${r.n}</td><td><code>${esc(r.generator)}</code></td>
+        <td class="num">${r.done}/${r.total}</td><td class="num">${r.accepted}</td>
+        <td class="num">${nn(r.judge_score)}</td><td class="num">${nn(r.check_before)}</td>
+        <td class="num">${nn(r.check_after)}</td>
+        <td class="num ${r.gain > 0 ? "ok" : r.gain < 0 ? "bad" : ""}">${r.gain > 0 ? "+" : ""}${nn(r.gain)}</td></tr>`).join("") +
+      `</tbody></table></div>`;
+  } else if (s.kind === "finetune") {
+    const p = s.progress || {}, t = (s.train || {}).state || {};
+    const step = t.step || p.step || 0, max = t.max_steps || p.max_steps || 0;
+    h += `<div class="kpis">
+      ${kpi("version", esc(p.version || "-"), "from " + esc((s.config || {}).from_model || "base"))}
+      ${kpi("training examples", nn((p.dataset || {}).examples), "accepted answers in the corpus")}
+      ${kpi("step", step + "<small>/" + (max || "?") + "</small>", pct(step, max) + "%")}
+      ${kpi("loss", t.loss !== undefined && t.loss !== null ? Number(t.loss).toFixed(4) : "-",
+            "epoch " + nn(t.epoch))}
+      ${kpi("device", esc(t.device || "-"), esc(t.gpu || ""))}
+      ${kpi("last checkpoint", nn(p.last_checkpoint, "none yet"), "a Ctrl-C here loses nothing")}
+    </div>`;
+    h += `<h2>Phases</h2><div class="pipe">` + ["dataset", "deps", "base weights", "train", "merge", "gguf", "register"]
+      .map(n => { const cur = (s.phase || {}).name || ""; const on = n.startsWith(cur) || cur.startsWith(n.split(" ")[0]);
+        const done = phaseDone(n, p);
+        return `<div class="node ${on ? "hot" : ""}"><div class="n-name">${esc(n)}</div>
+          <div class="n-desc">${done ? '<span class="ok">done</span>' : (on ? "running" : "")}</div></div>`; }).join("") + `</div>`;
+  } else if (s.kind === "benchmark") {
+    const rows = s.rows || [], d = s.deltas || [];
+    const best = d.length ? d.reduce((a, b) => (b.delta > a.delta ? b : a)) : null;
+    const flagged = Object.values(s.contamination || {}).reduce((a, c) => a + (c.flagged || 0), 0);
+    const total = Object.values(s.contamination || {}).reduce((a, c) => a + (c.total || 0), 0);
+    h += `<div class="kpis">
+      ${kpi("measurements", rows.length, (s.plan || []).length + " still planned")}
+      ${kpi("best improvement", best ? (best.delta > 0 ? "+" : "") + best.delta + "<small> pts</small>" : "-",
+            best ? esc(best.model + " on " + best.bench) : "no comparison yet", best && best.delta > 0 ? "good" : "")}
+      ${kpi("problems flagged as memorised", flagged + "<small>/" + total + "</small>",
+            "excluded from the 'unseen only' column", flagged ? "bad" : "good")}
+    </div>`;
+    h += benchTable(rows, s.deltas);
+  }
+  h += configCard(s);
+  v.innerHTML = h || `<div class="card muted">waiting for the first update...</div>`;
+}
+function phaseDone(n, p) {
+  return ({ "dataset": !!p.dataset, "deps": !!p.backend, "base weights": !!p.base_hf,
+    "train": !!p.train_done, "merge": !!p.train_done, "gguf": !!p.gguf, "register": p.phase === "done" })[n];
+}
+
+/* ---------------------------------------------------------------- live calls */
+function kindColor(k) { return `var(--k-${k}, var(--k-call))`; }
+function drawLive() {
+  const v = $("#v-live");
+  const running = liveCalls.filter(c => !c.end), recent = liveCalls.filter(c => c.end);
+  let h = `<div class="controls"><span class="muted small">${running.length} generating now,
+    ${recent.length} just finished. Click a card for the full text.</span></div><div class="live">`;
+  const card = c => {
+    const txt = livePreview[c.id] || "";
+    const done = pct(c.n, c.max);
+    return `<div class="lc" data-id="${c.id}">
+      <div class="lc-top"><span class="lc-tag"><span class="kind" style="background:${kindColor(c.kind)}"></span>${esc(c.tag || c.kind)}</span>
+      <span class="chip ${c.err ? "bad" : c.end ? "" : "acc"}">${c.err ? "error" : c.end ? "done" : c.kind}</span></div>
+      <div class="small muted" style="display:flex;gap:10px;justify-content:space-between;margin-bottom:5px">
+        <span>${c.n}/${c.max} tok  -  ${c.tps} tok/s${c.looped ? '  -  <span class="warn">cut: repeating</span>' : ""}</span>
+        <span>${esc(c.model || "")}</span></div>
+      <div class="bar-bg" style="margin-bottom:6px"><div class="bar-fg ${done > 90 ? "warn" : ""}" style="width:${Math.min(100, done)}%"></div></div>
+      <div class="lc-text">${esc(txt.slice(-900))}</div></div>`;
+  };
+  h += running.map(card).join("") + recent.map(card).join("") + `</div>`;
+  if (!liveCalls.length) h = `<div class="card muted">Nothing is generating right now.</div>`;
+  v.innerHTML = h;
+  v.querySelectorAll(".lc").forEach(n => n.onclick = () => openCall(+n.dataset.id));
+}
+async function openCall(id) {
+  const d = await jget(base + "/api/live?id=" + id).catch(() => null);
+  if (!d || !d.call) return;
+  openModal(d.call.tag || "call " + id,
+    `${d.call.kind} - ${d.call.n} tokens - ${d.call.tps} tok/s${d.call.looped ? " - cut for repetition" : ""}`,
+    `<pre class="code" style="max-height:70vh">${esc(d.text || "")}</pre>`);
+}
+function openModal(title, sub, html) {
+  $("#mTitle").textContent = title; $("#mSub").textContent = sub || ""; $("#mBody").innerHTML = html;
+  $("#modal").showModal();
+}
+
+/* ---------------------------------------------------------------- corpus */
+let corpusRound = null, corpusCache = null;
+async function drawCorpus() {
+  const v = $("#v-corpus");
+  const d = await jget(base + "/api/questions" + (corpusRound ? "?round=" + corpusRound : "")).catch(() => null);
+  if (!d) { v.innerHTML = `<div class="card muted">no exercises yet</div>`; return; }
+  corpusCache = d; corpusRound = d.round;
+  let h = `<div class="controls"><label class="muted small">round</label>
+    <select id="roundSel">${(d.rounds || []).map(n => `<option ${n === d.round ? "selected" : ""}>${n}</option>`).join("")}</select>
+    <span class="muted small">${d.questions.filter(q => q.complete).length}/${d.questions.length} finished,
+    ${d.questions.filter(q => q.accepted).length} accepted</span></div>`;
+  h += `<div class="card" style="padding:2px 4px"><table><thead><tr><th>id</th><th>exercise</th><th>topic</th>
+    <th>difficulty</th><th>best</th><th class="num">judges</th><th class="num">checker</th>
+    <th class="num">after</th><th>status</th></tr></thead><tbody>` +
+    d.questions.map(q => `<tr class="click" data-qid="${esc(q.qid)}">
+      <td><code>${esc(q.qid)}</code></td><td>${esc(q.title)}</td><td class="muted">${esc(q.topic)}</td>
+      <td class="muted">${esc(q.difficulty)} / ${esc(q.size)}</td>
+      <td>${q.best ? "<b>" + esc(q.best) + "</b>" : "-"}</td>
+      <td class="num">${nn(q.judge_score)}</td><td class="num">${nn(q.before)}</td>
+      <td class="num ${q.after > q.before ? "ok" : ""}">${nn(q.after)}</td>
+      <td>${q.active ? `<span class="chip acc">${esc(q.active)}</span>` :
+        q.accepted ? `<span class="chip ok">accepted</span>` :
+        q.complete ? `<span class="chip warn">rejected</span>` : `<span class="chip">waiting</span>`}</td></tr>`).join("") +
+    `</tbody></table></div>`;
+  v.innerHTML = h;
+  $("#roundSel").onchange = e => { corpusRound = +e.target.value; drawCorpus(); };
+  v.querySelectorAll("tr.click").forEach(tr => tr.onclick = () => openQuestion(tr.dataset.qid));
+}
+async function openQuestion(qid) {
+  const rec = await jget(base + "/api/question?round=" + corpusRound + "&qid=" + encodeURIComponent(qid)).catch(() => null);
+  if (!rec) return;
+  const q = rec.question || {};
+  const secs = rec.t_end && rec.t_start ? fmtT(rec.t_end - rec.t_start) : "";
+  let h = `<div class="card"><b>${esc(q.title)}</b>
+    <span class="chip">${esc(q.topic)}</span><span class="chip">${esc(q.difficulty)}</span>
+    <span class="chip">${esc(q.size)}</span>
+    <div style="white-space:pre-wrap;margin-top:8px">${esc(q.question)}</div>
+    <h3>must get right</h3><ul>${(q.checks || []).map(c => `<li class="note">${esc(c)}</li>`).join("")}</ul></div>`;
+  const v = rec.verdict || {};
+  h += `<h2>Verdict <span class="muted small">${v.judges_ok || 0}/3 judges returned usable JSON</span></h2>
+    <div class="grid2">`;
+  ["A", "B", "C"].forEach(slot => {
+    const a = (rec.answers || []).find(x => x.slot === slot) || {};
+    const p = (v.per_answer || {})[slot] || {};
+    const win = v.best === slot;
+    h += `<div class="card" style="${win ? "border-color:var(--ok)" : ""}">
+      <div style="display:flex;gap:8px;align-items:center">
+        <b>Answer ${slot}</b><span class="chip">${esc(a.persona || "")}</span>
+        ${win ? '<span class="chip ok">chosen</span>' : ""}
+        <span style="flex:1"></span>
+        <span class="chip">judges ${nn(p.overall)}/10</span>
+        <span class="chip">checker ${nn((a.check || {}).score)}/100</span></div>
+      <div class="small muted" style="margin-top:6px">${esc((a.check || {}).summary || "")}</div>
+      ${axesRows(rec, slot)}
+      <div style="margin-top:8px"><button class="btn sm" data-show="${slot}">show the answer</button></div></div>`;
+  });
+  h += `</div>`;
+  if ((v.fix_list || []).length) h += `<h2>Combined fix list</h2><div class="card"><ol>` +
+    v.fix_list.map(f => `<li class="note">${esc(f)}</li>`).join("") + `</ol></div>`;
+  if (rec.lint_summary) h += `<h2>Checker findings, condensed by the model</h2>
+    <div class="card"><pre class="code">${esc(rec.lint_summary)}</pre></div>`;
+  if (rec.final) h += `<h2>Rewritten answer
+    <span class="muted small">checker ${nn((rec.final.check || {}).score)}/100
+    ${rec.gain > 0 ? '<span class="ok">(+' + rec.gain + ')</span>' : rec.gain < 0 ? '<span class="bad">(' + rec.gain + ')</span>' : ""}
+    ${rec.accepted ? '<span class="chip ok">accepted into the corpus</span>' : '<span class="chip warn">not accepted</span>'}</span></h2>
+    <div class="card"><div class="small muted">${esc((rec.final.check || {}).summary || "")}</div>
+    <pre class="code">${esc(rec.final.text || "")}</pre>
+    ${findingsList(rec.final.check)}</div>`;
+  openModal(qid + "  " + (q.title || ""), secs ? "took " + secs : "", h);
+  $("#mBody").querySelectorAll("[data-show]").forEach(b => b.onclick = () => {
+    const a = (rec.answers || []).find(x => x.slot === b.dataset.show) || {};
+    openModal("Answer " + b.dataset.show + " - " + (a.persona || ""), (a.check || {}).summary || "",
+      `<pre class="code" style="max-height:60vh">${esc(a.text || "")}</pre>` + findingsList(a.check));
+  });
+}
+function axesRows(rec, slot) {
+  const axes = ["correctness", "robustness", "efficiency", "style"];
+  const per = axes.map(ax => {
+    const vals = (rec.judges || []).map(j => (j.scores || {})[slot]).filter(Boolean).map(x => x[ax]);
+    return [ax, vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null];
+  });
+  let h = `<div class="axes" style="margin-top:8px">`;
+  per.forEach(([ax, val]) => {
+    h += `<span class="small muted">${ax}</span>
+      <div class="bar-bg"><div class="bar-fg ${val >= 7 ? "ok" : val >= 5 ? "" : "bad"}"
+        style="width:${val ? val * 10 : 0}%"></div></div>
+      <span class="small">${val ? val.toFixed(1) : "-"}</span>`;
+  });
+  h += `</div>`;
+  const notes = (rec.judges || []).flatMap(j => ((j.notes || {})[slot] || {}).bad || []).slice(0, 3);
+  if (notes.length) h += `<ul style="margin:8px 0 0">` +
+    notes.map(n => `<li class="note b">${esc(n)}</li>`).join("") + `</ul>`;
+  return h;
+}
+function findingsList(check) {
+  const f = (check || {}).findings || [];
+  if (!f.length) return `<div class="small ok">the checker found nothing</div>`;
+  return `<h3>checker findings</h3><table><tbody>` + f.slice(0, 40).map(x =>
+    `<tr><td><span class="chip ${x.severity === "error" ? "bad" : x.severity === "warning" ? "warn" : ""}">${esc(x.severity)}</span></td>
+     <td class="muted">${esc(x.tool)} ${esc(x.rule)}</td><td class="num">${x.line || ""}</td>
+     <td>${esc(x.msg)}</td></tr>`).join("") + `</tbody></table>`;
+}
+
+/* ---------------------------------------------------------------- training */
+function drawTraining() {
+  const s = state, t = s.train || {}, st = t.state || {}, steps = t.steps || [];
+  const v = $("#v-training");
+  let h = `<div class="kpis">
+    ${kpi("step", (st.step || 0) + "<small>/" + (st.max_steps || "?") + "</small>", pct(st.step, st.max_steps) + "%")}
+    ${kpi("loss", st.loss != null ? Number(st.loss).toFixed(4) : "-", "epoch " + nn(st.epoch))}
+    ${kpi("trainable", st.trainable ? (st.trainable / 1e6).toFixed(1) + "M" : "-",
+      st.total ? "of " + (st.total / 1e6).toFixed(0) + "M parameters" : "")}
+    ${kpi("examples", nn(st.examples), "")}</div>`;
+  h += `<h2>Loss</h2><div class="card">${lossChart(steps)}</div>`;
+  const cfg = s.config || {};
+  h += `<h2>Recipe</h2><div class="card"><table><tbody>` +
+    ["rank", "alpha", "epochs", "lr", "seq_len", "batch", "accum", "min_score", "from_model", "rounds"]
+      .map(k => `<tr><td class="muted">${k}</td><td><code>${esc(nn(cfg[k], "-"))}</code></td></tr>`).join("") +
+    `</tbody></table></div>`;
+  if ((t.log || []).length) h += `<h2>Trainer output</h2><div class="card feed">` +
+    t.log.slice(-40).map(l => `<div>${esc(l)}</div>`).join("") + `</div>`;
+  v.innerHTML = h;
+}
+function lossChart(steps) {
+  const pts = steps.filter(p => p.loss != null);
+  if (pts.length < 2) return `<div class="muted small">waiting for the first steps...</div>`;
+  const W = 900, H = 190, pad = 34;
+  const xs = pts.map(p => p.step), ys = pts.map(p => p.loss);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = v => pad + (W - pad - 8) * (v - x0) / Math.max(1, x1 - x0);
+  const sy = v => H - 22 - (H - 40) * (v - y0) / Math.max(1e-9, y1 - y0);
+  const d = pts.map((p, i) => (i ? "L" : "M") + sx(p.step).toFixed(1) + " " + sy(p.loss).toFixed(1)).join(" ");
+  // a simple moving average makes the trend readable through the noise
+  const k = Math.max(1, Math.round(pts.length / 25)), sm = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts.slice(Math.max(0, i - k), i + 1);
+    sm.push([pts[i].step, a.reduce((z, p) => z + p.loss, 0) / a.length]);
+  }
+  const d2 = sm.map((p, i) => (i ? "L" : "M") + sx(p[0]).toFixed(1) + " " + sy(p[1]).toFixed(1)).join(" ");
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line x1="${pad}" y1="${H - 22}" x2="${W - 8}" y2="${H - 22}" stroke="var(--line2)"/>
+    <line x1="${pad}" y1="18" x2="${pad}" y2="${H - 22}" stroke="var(--line2)"/>
+    <text x="2" y="22" fill="var(--muted)" font-size="11">${y1.toFixed(2)}</text>
+    <text x="2" y="${H - 24}" fill="var(--muted)" font-size="11">${y0.toFixed(2)}</text>
+    <text x="${W - 40}" y="${H - 6}" fill="var(--muted)" font-size="11">step ${x1}</text>
+    <path d="${d}" fill="none" stroke="var(--line2)" stroke-width="1"/>
+    <path d="${d2}" fill="none" stroke="var(--accent)" stroke-width="2"/></svg>
+    <div class="legend"><span><span class="swatch" style="background:var(--line2)"></span>per step</span>
+    <span><span class="swatch" style="background:var(--accent)"></span>moving average</span></div>`;
+}
+
+/* ---------------------------------------------------------------- benchmark */
+function benchTable(rows, deltas) {
+  if (!rows || !rows.length) return `<div class="card muted">no measurements yet</div>`;
+  const byBench = {};
+  rows.forEach(r => (byBench[r.bench] = byBench[r.bench] || []).push(r));
+  let h = "";
+  Object.keys(byBench).sort().forEach(b => {
+    const rs = byBench[b].slice().sort((x, y) => (x.model > y.model ? 1 : -1));
+    const baseRow = rs.find(r => r.model.startsWith("base"));
+    h += `<h2>${esc(b)} <span class="muted small">pass@1, unit tests actually executed</span></h2>
+      <div class="card"><table><thead><tr><th>model</th><th style="width:34%">pass@1</th>
+      <th class="num">passed</th><th class="num">unseen only</th><th class="num">vs base</th>
+      <th class="num">flagged</th><th class="num">avg tokens</th></tr></thead><tbody>`;
+    rs.forEach(r => {
+      const d = baseRow && r !== baseRow ? +(r.pass_rate - baseRow.pass_rate).toFixed(1) : null;
+      const dc = baseRow && r !== baseRow && r.pass_rate_clean != null && baseRow.pass_rate_clean != null
+        ? +(r.pass_rate_clean - baseRow.pass_rate_clean).toFixed(1) : null;
+      h += `<tr class="click" data-model="${esc(r.model)}" data-bench="${esc(b)}">
+        <td><code>${esc(r.model)}</code>${r.complete ? "" : ' <span class="chip warn">partial</span>'}</td>
+        <td><div style="display:flex;gap:8px;align-items:center"><div class="bar-bg" style="flex:1">
+          <div class="bar-fg ok" style="width:${r.pass_rate}%"></div></div>
+          <b>${r.pass_rate.toFixed(1)}%</b></div></td>
+        <td class="num">${r.passed}/${r.n}</td>
+        <td class="num">${r.pass_rate_clean != null ? r.pass_rate_clean.toFixed(1) + "%" : "-"}</td>
+        <td class="num ${d > 0 ? "ok" : d < 0 ? "bad" : ""}">${d == null ? "-" : (d > 0 ? "+" : "") + d +
+          (dc != null ? ` <span class="faint">(${dc > 0 ? "+" : ""}${dc})</span>` : "")}</td>
+        <td class="num">${r.flagged}</td><td class="num">${r.avg_tokens}</td></tr>`;
+    });
+    h += `</tbody></table></div>`;
+  });
+  return h;
+}
+function drawBenchmark() {
+  const s = state, v = $("#v-benchmark");
+  let h = benchTable(s.rows, s.deltas);
+  const c = s.contamination || {};
+  if (Object.keys(c).length) {
+    h += `<h2>Contamination screen</h2><div class="card">
+      <div class="small muted">Every problem statement is cut at 45% and the base model is asked to reproduce
+      the rest word for word. A problem it can reproduce is flagged as memorised and left out of the
+      "unseen only" column.</div><table style="margin-top:8px"><thead><tr><th>benchmark</th>
+      <th class="num">problems</th><th class="num">flagged</th><th class="num">share</th></tr></thead><tbody>` +
+      Object.keys(c).map(b => `<tr><td>${esc(b)}</td><td class="num">${c[b].total}</td>
+        <td class="num ${c[b].flagged ? "bad" : "ok"}">${c[b].flagged}</td>
+        <td class="num">${pct(c[b].flagged, c[b].total)}%</td></tr>`).join("") + `</tbody></table></div>`;
+  }
+  const active = s.active || {};
+  if (Object.keys(active).length) h += `<h3>solving now</h3><div class="card small muted">` +
+    Object.keys(active).slice(0, 40).map(k => esc(k)).join(", ") + `</div>`;
+  v.innerHTML = h;
+  v.querySelectorAll("tr.click").forEach(tr => tr.onclick = () => openResults(tr.dataset.model, tr.dataset.bench));
+}
+async function openResults(model, bench) {
+  const d = await jget(base + "/api/results?model=" + encodeURIComponent(model) + "&bench=" + encodeURIComponent(bench)).catch(() => null);
+  if (!d) return;
+  const rs = d.results || [];
+  const h = `<div class="card small muted">${rs.filter(r => r.passed).length} of ${rs.length} passed.
+    Click a row for the code the model wrote.</div>
+    <table><thead><tr><th>problem</th><th>result</th><th>why</th><th class="num">tok</th><th class="num">s</th></tr></thead><tbody>` +
+    rs.map(r => `<tr class="click" data-task="${esc(r.task_id)}">
+      <td><code>${esc(r.task_id)}</code></td>
+      <td>${r.passed ? '<span class="chip ok">pass</span>' : '<span class="chip bad">fail</span>'}</td>
+      <td class="muted">${esc(r.why || "")}</td><td class="num">${nn(r.tokens)}</td><td class="num">${nn(r.secs)}</td></tr>`).join("") +
+    `</tbody></table>`;
+  openModal(model + " on " + bench, "", h);
+  $("#mBody").querySelectorAll("tr.click").forEach(tr => tr.onclick = async () => {
+    const r = await jget(base + "/api/result?model=" + encodeURIComponent(model) + "&bench=" +
+      encodeURIComponent(bench) + "&task=" + encodeURIComponent(tr.dataset.task)).catch(() => null);
+    if (!r) return;
+    openModal(r.task_id, (r.passed ? "passed" : "failed: " + r.why),
+      (r.stderr ? `<h3>error</h3><pre class="code">${esc(r.stderr)}</pre>` : "") +
+      `<h3>code</h3><pre class="code">${esc(r.code || "")}</pre>
+       <h3>full answer</h3><pre class="code">${esc(r.answer || "")}</pre>`);
+  });
+}
+
+/* ---------------------------------------------------------------- events */
+function drawEvents() {
+  const v = $("#v-events");
+  v.innerHTML = `<div class="card feed">` + events.slice(-500).reverse().map(e => {
+    const t = new Date(e.t * 1000).toLocaleTimeString();
+    const cls = e.kind === "warn" ? "warn" : e.kind === "result" || e.kind === "done" ? "ok" : "";
+    return `<div><span class="t">${t}</span><span class="k">[${esc(e.kind)}]</span>
+      <span class="${cls}">${esc(e.msg)}</span></div>`;
+  }).join("") + `</div>`;
+}
+
+/* ---------------------------------------------------------------- boot */
+$("#theme").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "light" : cur === "light" ? "" : "dark";
+  if (next) document.documentElement.setAttribute("data-theme", next);
+  else document.documentElement.removeAttribute("data-theme");
+  try { localStorage.setItem("rli-theme", next); } catch (e) {}
+};
+try { const t = localStorage.getItem("rli-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+discover().then(() => { tick(true); setInterval(tick, 2000); });
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+__pycache__/
+.venv/
+data/
+models/
+state/
+logs/
+ollama_bin/
+*.part
+.python/
+.ruff_cache/
+
+# Agent and assistant instruction files. These describe how someone's local tooling should
+# behave, not how this project works, so they stay on the machine that made them.
+AGENTS.md
+agents.md
+CLAUDE.md
+CLAUDE.local.md
+claude.md
+claude.local.md
+.claude/
+.claude*
