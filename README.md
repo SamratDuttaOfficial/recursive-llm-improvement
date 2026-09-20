@@ -146,6 +146,19 @@ fail to return usable JSON the checker decides by itself.
 findings go back to the model, which produces the corrected solution. That is checked again and saved as
 the training pair, with the before/after checker scores so you can see whether the rewrite actually helped.
 
+**A rewrite that came out worse is refused.** A second attempt by the same 0.8B model is not always an
+improvement - it drops the import it was using, re-indents a working function into a syntax error, or hangs
+on an input the original handled. So the rewrite is compared against the answer it was asked to improve,
+and the exercise keeps the judges' pick instead if any of this is true:
+
+- it came back with no usable code
+- it times out, stops importing, or fails its own worked examples where the original did not
+- the checker finds more errors, or more warnings, than in the answer it was given
+
+The refused rewrite is still stored on the record - the detail view shows it with the reason - it just does
+not go into the corpus. `reverted` in the round table and on the dashboard counts how often this happens;
+a high number means the rewrite step is hurting more than helping.
+
 **Every rewrite is saved, and every saved answer is trained on.** There is no quality gate anywhere in the
 pipeline: one exercise in, one training pair out, and the whole corpus goes into the fine-tune. A rewrite
 that still has checker errors is written all the same and flagged `clean: false`, because what the model
@@ -283,6 +296,7 @@ config.json                                   the model, the agents, the prompts
 state/<run>/rounds/round_001/questions.json   the exercise set
 state/<run>/rounds/round_001/q_r001q007.json  one exercise: every answer, every judge, verdict, rewrite
 state/<run>/corpus/round_001.jsonl            one training pair per exercise, nothing filtered out
+state/<run>/corpus/<anything>/*.jsonl         another machine's corpus, merged in - see below
 state/<run>/ft/v1/                            dataset, checkpoints, adapter, merged model, progress
 state/<run>/ft/v2/                            the next version (from base, or stacked on v1)
 state/<run>/bench/<model>/<bench>/            one file per problem, plus the summaries
@@ -293,6 +307,42 @@ models/registry.json                          base + every version, and where th
 data/                                         downloaded benchmarks and the contamination screens
 logs/                                         llama-server, ollama and trainer output
 ```
+
+## Building the corpus on more than one machine
+
+Generation is the slow part, so it is worth splitting across whatever hardware you have and training on the
+combined result. Run `run.py` on each machine as normal - nothing has to be coordinated - then bring the
+corpora together before `finetune.py`.
+
+Every corpus row is stamped with the machine that wrote it (`host`) and the run it belongs to, so a merged
+corpus still says where each answer came from. There are two ways to combine them:
+
+```bash
+cp -r /path/from/laptop/state/default/corpus  state/default/corpus/from-laptop
+```
+
+```bash
+./finetune.sh --corpus /mnt/share/laptop-corpus --corpus /mnt/share/workstation-corpus
+```
+
+The first copies the files in; the search under `corpus/` is recursive, so `from-laptop/round_001.jsonl`
+does not collide with the local `round_001.jsonl` - which matters, because every machine starts at round 1
+and names its files identically. The second reads them where they are and copies nothing. Both can be used
+at once, and naming the same corpus twice does not count it twice.
+
+Answers are then de-duplicated by exercise, so the same exercise solved on two machines contributes one
+training pair, and a later round's answer replaces an earlier one. `finetune.py` prints what it read:
+
+```
+corpus   4 corpus files, 9 answers, 7 after de-duplicating by exercise
+             3  default/corpus/round_001.jsonl
+             3  default/corpus/from-laptop/round_001.jsonl
+             1  default/corpus/from-laptop/round_002.jsonl
+             2  laptop-corpus/round_001.jsonl
+dataset  7 training examples from rounds 1, 2 across 3 machines (avg 321 chars)
+```
+
+Only the corpus needs merging. Fine-tuning and benchmarking then run once, on the machine with the GPU.
 
 ## Flags worth knowing
 
@@ -306,7 +356,8 @@ scripts also take `--config PATH`, `--print-config` and `--init-config`.
 `--question-top-p` / `--question-min-p` how adventurous the exercise writer is -
 `--no-exec` lint without running - `--run name` a separate experiment - `-v`
 
-**`finetune.py`** `--rounds 1,2` which corpus rounds - `--from-model base|latest|v1` retrain from base or
+**`finetune.py`** `--rounds 1,2` which corpus rounds - `--corpus PATH` another machine's corpus, repeatable
+- `--from-model base|latest|v1` retrain from base or
 stack on a version - `--version v4` name it - `--epochs`, `--lr`, `--rank`, `--seq-len`, `--batch`,
 `--accum` - `--load-4bit` - `--force` train despite the duplicate guard - `--restart` - `--no-gguf`
 

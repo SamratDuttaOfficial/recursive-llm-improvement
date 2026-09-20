@@ -304,7 +304,8 @@ function configCard(s) {
     add("answer ceiling", c.answer_tokens + " tokens");
     add("who picks the winner", "judges " + Math.round(c.judge_weight * 100) + "%, checker " +
       Math.round((1 - c.judge_weight) * 100) + "%");
-    add("corpus", "every rewritten answer is saved, nothing is filtered out");
+    add("corpus", "one answer per exercise, nothing filtered out; a rewrite that came out " +
+      "worse loses to the judges' pick");
   } else if (s.kind === "finetune") {
     add("from", c.from_model);
     add("recipe", "LoRA r=" + c.rank + " alpha=" + c.alpha + ", " + c.epochs + " epochs, lr " + c.lr +
@@ -328,6 +329,7 @@ function drawOverview() {
     const rounds = s.rounds || [], cur = rounds[rounds.length - 1] || {};
     const done = rounds.reduce((a, r) => a + r.done, 0), tot = rounds.reduce((a, r) => a + r.total, 0);
     const cln = rounds.reduce((a, r) => a + (r.clean || 0), 0);
+    const rev = rounds.reduce((a, r) => a + (r.reverted || 0), 0);
     const withGain = rounds.filter(r => r.gain !== null && r.gain !== undefined);
     const gain = withGain.length ? (withGain.reduce((a, r) => a + r.gain, 0) / withGain.length).toFixed(1) : null;
     h += `<div class="kpis">
@@ -335,6 +337,7 @@ function drawOverview() {
       ${kpi("exercises", done + "<small>/" + tot + "</small>", pct(done, tot) + "% of this run")}
       ${kpi("in the corpus", done, "every finished exercise", "good")}
       ${kpi("clean", cln, done ? pct(cln, done) + "% run with no checker errors" : "")}
+      ${kpi("rewrite refused", rev, rev ? "kept the judges' pick instead" : "every rewrite held up")}
       ${kpi("judge score", nn(cur.judge_score) + "<small>/10</small>", "mean for the winning answer")}
       ${kpi("checker after rewrite", nn(cur.check_after) + "<small>/100</small>",
             "before the rewrite: " + nn(cur.check_before))}
@@ -353,10 +356,11 @@ function drawOverview() {
       names.map(q => `<tr><td><code>${esc(q)}</code></td><td class="muted">${esc(active[q])}</td></tr>`).join("") +
       `</tbody></table></div>`;
     h += `<h2>Rounds</h2><div class="card"><table><thead><tr><th>round</th><th>generator</th>
-      <th class="num">done</th><th class="num">clean</th><th class="num">judge</th>
+      <th class="num">done</th><th class="num">clean</th><th class="num">reverted</th><th class="num">judge</th>
       <th class="num">checker before</th><th class="num">after</th><th class="num">gain</th></tr></thead><tbody>` +
       rounds.map(r => `<tr><td>${r.n}</td><td><code>${esc(r.generator)}</code></td>
         <td class="num">${r.done}/${r.total}</td><td class="num">${nn(r.clean)}</td>
+        <td class="num">${nn(r.reverted)}</td>
         <td class="num">${nn(r.judge_score)}</td><td class="num">${nn(r.check_before)}</td>
         <td class="num">${nn(r.check_after)}</td>
         <td class="num ${r.gain > 0 ? "ok" : r.gain < 0 ? "bad" : ""}">${r.gain > 0 ? "+" : ""}${nn(r.gain)}</td></tr>`).join("") +
@@ -457,6 +461,7 @@ async function drawCorpus() {
       <td class="num">${nn(q.judge_score)}</td><td class="num">${nn(q.before)}</td>
       <td class="num ${q.after > q.before ? "ok" : ""}">${nn(q.after)}</td>
       <td>${q.active ? `<span class="chip acc">${esc(q.active)}</span>` :
+        q.kept === "original" ? `<span class="chip warn" title="${esc(q.regression || "")}">kept the original</span>` :
         q.clean ? `<span class="chip ok">clean</span>` :
         q.complete ? `<span class="chip warn">has errors</span>` : `<span class="chip">waiting</span>`}</td></tr>`).join("") +
     `</tbody></table></div>`;
@@ -485,6 +490,7 @@ async function openQuestion(qid) {
       <div style="display:flex;gap:8px;align-items:center">
         <b>Answer ${slot}</b><span class="chip">${esc(a.persona || "")}</span>
         ${win ? '<span class="chip ok">chosen</span>' : ""}
+        ${win && rec.kept === "original" ? '<span class="chip ok">saved to the corpus</span>' : ""}
         <span style="flex:1"></span>
         <span class="chip">judges ${nn(p.overall)}/10</span>
         <span class="chip">checker ${nn((a.check || {}).score)}/100</span></div>
@@ -497,11 +503,15 @@ async function openQuestion(qid) {
     v.fix_list.map(f => `<li class="note">${esc(f)}</li>`).join("") + `</ol></div>`;
   if (rec.lint_summary) h += `<h2>Checker findings, condensed by the model</h2>
     <div class="card"><pre class="code">${esc(rec.lint_summary)}</pre></div>`;
+  const rg = rec.rewrite_gain !== undefined ? rec.rewrite_gain : rec.gain;
   if (rec.final) h += `<h2>Rewritten answer
     <span class="muted small">checker ${nn((rec.final.check || {}).score)}/100
-    ${rec.gain > 0 ? '<span class="ok">(+' + rec.gain + ')</span>' : rec.gain < 0 ? '<span class="bad">(' + rec.gain + ')</span>' : ""}
-    <span class="chip ok">saved to the corpus</span>
-    ${rec.clean ? "" : '<span class="chip warn">has checker errors</span>'}</span></h2>
+    ${rg > 0 ? '<span class="ok">(+' + rg + ')</span>' : rg < 0 ? '<span class="bad">(' + rg + ')</span>' : ""}
+    ${rec.kept === "original"
+      ? '<span class="chip warn">refused: ' + esc(rec.regression || "worse than the answer it replaced") +
+        '</span> <span class="chip">the chosen answer above went into the corpus instead</span>'
+      : '<span class="chip ok">saved to the corpus</span>' +
+        (rec.clean ? "" : '<span class="chip warn">has checker errors</span>')}</span></h2>
     <div class="card"><div class="small muted">${esc((rec.final.check || {}).summary || "")}</div>
     <pre class="code">${esc(rec.final.text || "")}</pre>
     ${findingsList(rec.final.check)}</div>`;

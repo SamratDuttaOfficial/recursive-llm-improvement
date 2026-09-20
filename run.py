@@ -22,7 +22,7 @@ judges keep using the untouched base model.
 how much runs in parallel, every budget and every threshold. It is written on the first run, and a flag on
 the command line overrides it for one run.
 """
-import argparse, concurrent.futures as cf, json, os, random, re, sys, threading, time
+import argparse, concurrent.futures as cf, json, os, random, re, socket, sys, threading, time
 
 import config as conf
 import prompts
@@ -35,6 +35,10 @@ from common import (Backend, Dash, Interrupted, Log, Registry, STATE, STATS, Sto
 # itself to however many there are, including the judges' JSON schema and the aggregation.
 LETTERS = "ABC"
 SLOTS = {"A": 0, "B": 1, "C": 2}
+
+# Stamped on every corpus row. A corpus is meant to be carried between machines and merged, and once two
+# of them are in one folder the only way to tell which run produced a row is to have written it down.
+HOST = re.sub(r"[^\w.-]", "-", socket.gethostname() or "unknown")[:40]
 
 # Which config key backs each flag. A flag the user actually passes wins; anything else comes from the file.
 CONFIG_MAP = {
@@ -66,6 +70,43 @@ def best_answer(rec):
         return None
     i = SLOTS.get((rec.get("verdict") or {}).get("best"), 0)
     return answers[i] if i < len(answers) else answers[0]
+
+
+def kept_answer(rec):
+    """The answer this exercise actually contributes - the rewrite, unless the rewrite came out worse.
+
+    Records written before the rewrite could be refused have no `kept`, and default to it, so an old run
+    still reports the same numbers it always did."""
+    if (rec.get("kept") or "rewrite") == "original":
+        return best_answer(rec)
+    return rec.get("final") or best_answer(rec)
+
+
+def regression(old, new):
+    """Why the rewrite is worse than the answer it was asked to improve, or "" when it is not.
+
+    The rewrite is a second attempt by the same small model and it is allowed to come out worse: it drops
+    the import it was using, re-indents a working function into a syntax error, or hangs on an input the
+    original handled. None of that is an improvement, so the exercise keeps the answer the judges picked
+    and the rewrite stays on the record without going into the corpus. Three things count as worse, in the
+    order they are reported: it stopped building, it stopped running, or the checker found more in it."""
+    o, n = old.get("check") or {}, new.get("check") or {}
+    if not new.get("code"):
+        return "the rewrite came back with no usable code" if old.get("code") else ""
+    oe, ne = o.get("exec") or {}, n.get("exec") or {}
+    if oe and ne:                       # nothing to compare when the code was never run
+        if ne.get("timeout") and not oe.get("timeout"):
+            return "the rewrite times out"
+        if oe.get("import_ok") and not ne.get("import_ok"):
+            return "the rewrite does not run"
+        if (oe.get("examples") or {}).get("ok") and (ne.get("examples") or {}).get("ok") is False:
+            return "the rewrite fails its own worked examples"
+    oc, nc = o.get("counts") or {}, n.get("counts") or {}
+    for sev in ("error", "warning"):
+        before, after = int(oc.get(sev, 0)), int(nc.get(sev, 0))
+        if after > before:
+            return "the rewrite has %d %ss against %d" % (after, sev, before)
+    return ""
 
 
 # ---------------------------------------------------------------- tolerant JSON parsing
@@ -186,9 +227,11 @@ class Run:
             jsc = [r["verdict"]["best_score"] for r in done if r.get("verdict")]
             b4 = [best_answer(r)["check"]["score"]
                   for r in done if r.get("verdict") and best_answer(r)]
-            af = [r["final"]["check"]["score"] for r in done if r.get("final")]
+            af = [kept_answer(r)["check"]["score"] for r in done if kept_answer(r)]
+            reverted = [r for r in done if r.get("kept") == "original"]
             rounds.append({
                 "n": n, "total": len(qs), "done": len(done), "clean": len(clean),
+                "reverted": len(reverted),
                 "generator": (read_json(os.path.join(s.round_dir(n), "info.json"), {}) or {}).get("generator", "?"),
                 "judge_score": round(sum(jsc) / len(jsc), 2) if jsc else None,
                 "check_before": round(sum(b4) / len(b4), 1) if b4 else None,
@@ -393,23 +436,32 @@ class Loop:
             save()
         check_stop()
 
-        # --- 6. save the answer and the training pair
+        # --- 6. keep the rewrite unless it came out worse, and save the training pair
+        # Every exercise contributes an answer. Producing one is the job; deciding which exercises deserve
+        # to have one is not, so nothing is filtered out here - `clean` is a label for the reports and the
+        # checker score travels with the row. What is decided here is only which of the two answers to
+        # keep: a rewrite that no longer runs, or that the checker finds more errors or warnings in than
+        # the answer it was given, loses to the answer the judges picked. The rewrite stays on the record
+        # either way, so the detail view still shows what the second attempt did.
         fin = rec["final"]
-        # Every rewrite is saved. Producing an answer for each exercise is the job; deciding which
-        # exercises deserve to have one is not. An answer that came out badly is still what this model
-        # does with that question, and dropping it would quietly hide that. `clean` is a label for the
-        # reports only - it never keeps a row out - and the checker score travels with the row so that
-        # a later step can weigh it.
-        rec["clean"] = bool(fin["code"]) and fin["check"]["counts"].get("error", 0) == 0
-        rec["gain"] = fin["check"]["score"] - best["check"]["score"]
+        rec["regression"] = regression(best, fin)
+        rec["kept"] = "original" if rec["regression"] else "rewrite"
+        keep = kept_answer(rec)
+        rec["clean"] = bool(keep["code"]) and keep["check"]["counts"].get("error", 0) == 0
+        rec["gain"] = keep["check"]["score"] - best["check"]["score"]
+        rec["rewrite_gain"] = fin["check"]["score"] - best["check"]["score"]
         rec["complete"] = True
         rec["t_end"] = time.time()
         save()
+        if rec["regression"]:
+            vlog("revert", q["qid"] + ": keeping answer " + str(best.get("slot")) + " - " +
+                 rec["regression"])
         append_jsonl(s.r.corpus_path(n_round), {
             "qid": q["qid"], "round": n_round, "title": q["title"], "topic": q["topic"],
             "difficulty": q["difficulty"], "size": q["size"], "question": q["question"],
-            "answer": fin["text"], "check_score": fin["check"]["score"], "clean": rec["clean"],
-            "judge_score": rec["verdict"]["best_score"], "generator": rec["generator"]})
+            "answer": keep["text"], "check_score": keep["check"]["score"], "clean": rec["clean"],
+            "kept": rec["kept"], "judge_score": rec["verdict"]["best_score"],
+            "generator": rec["generator"], "host": HOST, "run": s.r.a.run})
         s.r.active.pop(q["qid"], None)
         return rec
 
@@ -561,7 +613,7 @@ def report(r, final=False):
     if not rows:
         return
     w = Log.paint
-    head = ("  round  gen        done         clean   judge  checker  after  gain")
+    head = ("  round  gen        done         clean  reverted   judge  checker  after  gain")
     lines = ["", w(head, "bold")]
     for row in rows:
         gain = row["gain"]
@@ -569,6 +621,7 @@ def report(r, final=False):
         lines.append("  " + str(row["n"]).rjust(5) + "  " + str(row["generator"])[:9].ljust(9) + "  " +
                      (str(row["done"]) + "/" + str(row["total"])).rjust(8) + "  " +
                      str(row["clean"]).rjust(9) + "  " +
+                     str(row.get("reverted", 0)).rjust(8) + "  " +
                      (str(row["judge_score"]) if row["judge_score"] is not None else "-").rjust(6) + "  " +
                      (str(row["check_before"]) if row["check_before"] is not None else "-").rjust(7) + "  " +
                      (str(row["check_after"]) if row["check_after"] is not None else "-").rjust(6) + "  " +
@@ -611,7 +664,9 @@ def make_api(r):
                             "judge_score": (rec.get("verdict") or {}).get("best_score"),
                             "before": ((best_answer(rec) or {}).get("check", {}).get("score")
                                        if rec.get("verdict") else None),
-                            "after": (rec.get("final") or {}).get("check", {}).get("score"),
+                            "after": (kept_answer(rec) or {}).get("check", {}).get("score"),
+                            "kept": rec.get("kept") if rec.get("complete") else None,
+                            "regression": rec.get("regression") or "",
                             "active": r.active.get(item["qid"])})
             return {"round": n, "rounds": r.round_nums(), "questions": out}
         if what == "question":
@@ -845,12 +900,15 @@ def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
                 done += 1
                 eta = (time.time() - t0) / done * (len(todo) - done)
                 mark = "clean" if rec["clean"] else "saved, has errors"
+                if rec.get("kept") == "original":
+                    mark = "kept " + str((best_answer(rec) or {}).get("slot", "the original")) + \
+                        ", " + rec["regression"]
                 log("result", q["qid"] + " " + q["title"][:38].ljust(38) + " best=" + rec["verdict"]["best"] +
                     " judges=" + str(rec["verdict"]["best_score"]) + "/10  checker " +
                     str((best_answer(rec) or {}).get("check", {}).get("score")) + "->" +
-                    str(rec["final"]["check"]["score"]) + "  " + mark + "   (" + str(done) + "/" +
-                    str(len(todo)) + ", eta " + fmt_t(eta) + ")",
-                    "green" if rec["clean"] else "yellow")
+                    str((kept_answer(rec) or {}).get("check", {}).get("score")) + "  " + mark +
+                    "   (" + str(done) + "/" + str(len(todo)) + ", eta " + fmt_t(eta) + ")",
+                    "green" if rec["clean"] and rec.get("kept") != "original" else "yellow")
         except (KeyboardInterrupt, Interrupted):
             Stop.set()
         if Stop.is_set():

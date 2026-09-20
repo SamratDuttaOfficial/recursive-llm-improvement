@@ -52,6 +52,43 @@ def corpus_rounds(run):
     return sorted(int(re.findall(r"\d+", f)[0]) for f in os.listdir(d) if re.match(r"round_\d+\.jsonl$", f))
 
 
+def short_path(path):
+    try:
+        return os.path.relpath(path, STATE)
+    except ValueError:                      # a different drive on Windows
+        return path
+
+
+def corpus_files(a):
+    """Every corpus file to train on: this machine's, plus whatever has been merged in.
+
+    A corpus built on another machine is combined by dropping its files in beside the local ones. The
+    search is recursive, so `state/<run>/corpus/from-laptop/round_001.jsonl` is picked up and does not
+    collide with the local `round_001.jsonl` - which matters, because every machine starts at round 1 and
+    names its files the same way. `--corpus PATH` reads a folder or a file in place, without copying.
+    Answers are de-duplicated by exercise afterwards, so the same exercise solved on two machines
+    contributes once.
+    """
+    roots = [os.path.join(STATE, a.run, "corpus")] + [str(p) for p in (getattr(a, "corpus", None) or [])]
+    found = []
+    for root in roots:
+        if os.path.isfile(root):
+            found.append(os.path.abspath(root))
+        elif os.path.isdir(root):
+            for dirpath, _dirs, names in os.walk(root):
+                found += [os.path.abspath(os.path.join(dirpath, n))
+                          for n in sorted(names) if n.endswith(".jsonl")]
+        elif root not in roots[:1]:
+            sys.exit("nothing to read at " + root + " (--corpus wants a .jsonl file or a folder of them)")
+    out, dedup = [], set()
+    for p in found:                         # the same file named twice is read once
+        k = os.path.normcase(p)
+        if k not in dedup:
+            dedup.add(k)
+            out.append(p)
+    return out
+
+
 def build_dataset(a, out_dir):
     """Every corpus answer from the requested rounds, newest rounds last, de-duplicated by exercise.
 
@@ -59,26 +96,35 @@ def build_dataset(a, out_dir):
     the model did badly is part of what it did. The checker score rides along on each row so the report
     can show the spread.
     """
-    corpus_dir = os.path.join(STATE, a.run, "corpus")
-    if not os.path.isdir(corpus_dir):
-        sys.exit("no corpus yet in " + corpus_dir + " - run `python run.py` first")
-    files = sorted(f for f in os.listdir(corpus_dir) if re.match(r"round_\d+\.jsonl$", f))
-    if a.rounds:
-        want = {int(x) for x in a.rounds.split(",") if x.strip()}
-        files = [f for f in files if int(re.findall(r"\d+", f)[0]) in want]
-    rows, seen, per_round = [], {}, {}
-    for f in files:
-        n = int(re.findall(r"\d+", f)[0])
-        per_round.setdefault(n, 0)
-        for it in read_jsonl(os.path.join(corpus_dir, f)):
-            key = re.sub(r"\W+", "", (it.get("title") or it.get("qid", "")).lower())
-            seen[key] = it          # a later round's answer to the same exercise replaces the earlier one
+    files = corpus_files(a)
+    if not files:
+        sys.exit("no corpus yet in " + os.path.join(STATE, a.run, "corpus") +
+                 " - run `python run.py` first")
+    want = {int(x) for x in a.rounds.split(",") if x.strip()} if a.rounds else None
+    everything, per_file = [], []
+    for path in files:
+        got = [it for it in read_jsonl(path) if want is None or int(it.get("round", 0)) in want]
+        everything += got
+        per_file.append((path, len(got)))
+    # Newest rounds last, so that when the same exercise appears twice the later answer is the one kept.
+    # Between two machines' round 1 the order is by host name, which is arbitrary but at least stable.
+    everything.sort(key=lambda it: (int(it.get("round", 0)), str(it.get("host", "")), str(it.get("qid", ""))))
+    rows, seen, per_round, hosts = [], {}, {}, {}
+    for it in everything:
+        key = re.sub(r"\W+", "", (it.get("title") or it.get("qid", "")).lower())
+        seen[key] = it
     for it in seen.values():
         per_round[it["round"]] = per_round.get(it["round"], 0) + 1
+        hosts[str(it.get("host") or "?")] = hosts.get(str(it.get("host") or "?"), 0) + 1
         text = chatml(it["question"], it["answer"])
-        rows.append({"text": text, "qid": it["qid"], "round": it["round"],
+        rows.append({"text": text, "qid": it["qid"], "round": it["round"], "host": it.get("host"),
                      "score": it.get("check_score"), "chars": len(text)})
-    rows.sort(key=lambda r: (r["round"], r["qid"]))
+    rows.sort(key=lambda r: (r["round"], str(r["host"] or ""), r["qid"]))
+    if len(files) > 1:
+        log("corpus", str(len(files)) + " corpus files, " + str(len(everything)) + " answers, " +
+            str(len(rows)) + " after de-duplicating by exercise")
+        for path, n in per_file:
+            log("corpus", "    " + str(n).rjust(5) + "  " + short_path(path), "dim")
     if len(rows) < a.min_examples:
         sys.exit("only " + str(len(rows)) + " answers in the corpus (need at least " + str(a.min_examples) +
                  "). Generate more with:  python run.py --new")
@@ -89,10 +135,13 @@ def build_dataset(a, out_dir):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     fingerprint = hashlib.sha1(
         "|".join(r["qid"] + ":" + str(r["score"]) for r in rows).encode()).hexdigest()[:16]
-    stats = {"examples": len(rows), "rounds": per_round, "chars": sum(r["chars"] for r in rows),
+    stats = {"examples": len(rows), "rounds": per_round, "hosts": hosts, "sources": len(files),
+             "chars": sum(r["chars"] for r in rows),
              "avg_chars": round(sum(r["chars"] for r in rows) / len(rows)), "fingerprint": fingerprint}
     log("dataset", str(len(rows)) + " training examples from rounds " +
-        ", ".join(str(k) for k in sorted(per_round)) + " (avg " + str(stats["avg_chars"]) + " chars)")
+        ", ".join(str(k) for k in sorted(per_round)) +
+        (" across " + str(len(hosts)) + " machines" if len(hosts) > 1 else "") +
+        " (avg " + str(stats["avg_chars"]) + " chars)")
     return path, stats
 
 
@@ -367,6 +416,10 @@ def main():
     conf.add_args(ap)
     ap.add_argument("--run", default="default")
     ap.add_argument("--rounds", default="", help="which corpus rounds to train on (default: all)")
+    ap.add_argument("--corpus", action="append", default=[], metavar="PATH",
+                    help="another machine's corpus to train on as well - a .jsonl file or a folder of "
+                         "them, repeatable. Copying those files into state/<run>/corpus/ does the same "
+                         "thing, at any depth, so the filenames cannot collide")
     ap.add_argument("--from-model", default=O,
                     help="what to fine-tune: 'base' (default: a clean run from the untouched model on the "
                          "whole corpus) or 'latest'/'v1' (stack: keep training that version's own weights "
