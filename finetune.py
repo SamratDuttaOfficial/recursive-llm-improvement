@@ -52,6 +52,14 @@ def corpus_rounds(run):
     return sorted(int(re.findall(r"\d+", f)[0]) for f in os.listdir(d) if re.match(r"round_\d+\.jsonl$", f))
 
 
+def rnd(it):
+    """The round a corpus row belongs to. 0 when the row predates the field or carries junk in it."""
+    try:
+        return int(it.get("round") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def short_path(path):
     try:
         return os.path.relpath(path, STATE)
@@ -95,29 +103,44 @@ def build_dataset(a, out_dir):
     Nothing is held back. run.py saves an answer for each exercise and all of them are trained on; what
     the model did badly is part of what it did. The checker score rides along on each row so the report
     can show the spread.
+
+    A row is read for what it has. `host`, `run`, `kept` and `clean` were added to the format later and a
+    corpus written before that has none of them - it still trains, it just reports its machine as unknown.
+    The only fields a row cannot do without are the question and the answer.
     """
     files = corpus_files(a)
     if not files:
         sys.exit("no corpus yet in " + os.path.join(STATE, a.run, "corpus") +
                  " - run `python run.py` first")
     want = {int(x) for x in a.rounds.split(",") if x.strip()} if a.rounds else None
-    everything, per_file = [], []
+    everything, per_file, skipped = [], [], 0
     for path in files:
-        got = [it for it in read_jsonl(path) if want is None or int(it.get("round", 0)) in want]
+        got = []
+        for it in read_jsonl(path):
+            if not isinstance(it, dict) or not str(it.get("question") or "").strip() \
+                    or not str(it.get("answer") or "").strip():
+                skipped += 1
+                continue
+            if want is not None and rnd(it) not in want:
+                continue
+            got.append(it)
         everything += got
         per_file.append((path, len(got)))
+    if skipped:
+        log("warn", str(skipped) + " corpus row(s) had no question or no answer and were left out", "yellow")
     # Newest rounds last, so that when the same exercise appears twice the later answer is the one kept.
     # Between two machines' round 1 the order is by host name, which is arbitrary but at least stable.
-    everything.sort(key=lambda it: (int(it.get("round", 0)), str(it.get("host", "")), str(it.get("qid", ""))))
+    everything.sort(key=lambda it: (rnd(it), str(it.get("host") or ""), str(it.get("qid") or "")))
     rows, seen, per_round, hosts = [], {}, {}, {}
     for it in everything:
-        key = re.sub(r"\W+", "", (it.get("title") or it.get("qid", "")).lower())
+        key = re.sub(r"\W+", "", (it.get("title") or it.get("qid") or it.get("question", ""))[:120].lower())
         seen[key] = it
-    for it in seen.values():
-        per_round[it["round"]] = per_round.get(it["round"], 0) + 1
-        hosts[str(it.get("host") or "?")] = hosts.get(str(it.get("host") or "?"), 0) + 1
+    for key, it in seen.items():
+        n, host = rnd(it), str(it.get("host") or "?")
+        per_round[n] = per_round.get(n, 0) + 1
+        hosts[host] = hosts.get(host, 0) + 1
         text = chatml(it["question"], it["answer"])
-        rows.append({"text": text, "qid": it["qid"], "round": it["round"], "host": it.get("host"),
+        rows.append({"text": text, "qid": it.get("qid") or key[:24], "round": n, "host": it.get("host"),
                      "score": it.get("check_score"), "chars": len(text)})
     rows.sort(key=lambda r: (r["round"], str(r["host"] or ""), r["qid"]))
     if len(files) > 1:
@@ -138,10 +161,13 @@ def build_dataset(a, out_dir):
     stats = {"examples": len(rows), "rounds": per_round, "hosts": hosts, "sources": len(files),
              "chars": sum(r["chars"] for r in rows),
              "avg_chars": round(sum(r["chars"] for r in rows) / len(rows)), "fingerprint": fingerprint}
+    named = [h for h in hosts if h != "?"]      # a corpus written before `host` existed reports as "?"
+    note = ([("across " + str(len(named)) + " machines")] if len(named) > 1 else []) + \
+           ([(str(hosts["?"]) + " with no machine stamp")] if hosts.get("?") and named else [])
     log("dataset", str(len(rows)) + " training examples from rounds " +
         ", ".join(str(k) for k in sorted(per_round)) +
-        (" across " + str(len(hosts)) + " machines" if len(hosts) > 1 else "") +
-        " (avg " + str(stats["avg_chars"]) + " chars)")
+        (" (" + ", ".join(note) + ")" if note else "") +
+        ", avg " + str(stats["avg_chars"]) + " chars")
     return path, stats
 
 

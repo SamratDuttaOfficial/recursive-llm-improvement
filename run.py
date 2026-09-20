@@ -6,13 +6,14 @@
 One command. It downloads Ollama if it is missing, pulls the model, starts a batched llama-server sized to
 the GPU, opens a live dashboard, and then, for every exercise:
 
-    the model writes a set of exercises  (it is told which ones already exist, so sets do not repeat)
+    the model writes a set of exercises  (a few per call, run hot, so that the sets differ)
       -> three solvers answer it independently, with different sampling and different strengths
       -> a static checker compiles, lints and actually runs each answer
       -> three judges see all three answers side by side and score them in JSON
       -> the best answer, the judges' criticism and a model-written summary of the checker's findings
          go back to the model, which rewrites the answer
-      -> the rewritten answer is checked again and saved as the training pair
+      -> the rewrite is checked again and saved as the training pair, unless it came out worse than
+         the answer it replaced, in which case that answer is kept instead
 
 Everything is written to disk the moment it is produced, so Ctrl-C is safe and re-running resumes at the
 exact sub-step that was interrupted. `--generator latest` answers with the newest fine-tuned model while the
@@ -70,6 +71,14 @@ def best_answer(rec):
         return None
     i = SLOTS.get((rec.get("verdict") or {}).get("best"), 0)
     return answers[i] if i < len(answers) else answers[0]
+
+
+def was_clean(rec):
+    """`clean` replaced the older `accepted` on a record. Read whichever one is there, so a run made
+    before the rename still reports numbers instead of zeroes."""
+    if "clean" in rec:
+        return bool(rec["clean"])
+    return bool(rec.get("accepted"))
 
 
 def kept_answer(rec):
@@ -223,7 +232,7 @@ class Run:
             qs = s.questions(n)
             recs = [s.record(n, q["qid"]) for q in qs]
             done = [r for r in recs if r and r.get("complete")]
-            clean = [r for r in done if r.get("clean")]
+            clean = [r for r in done if was_clean(r)]
             jsc = [r["verdict"]["best_score"] for r in done if r.get("verdict")]
             b4 = [best_answer(r)["check"]["score"]
                   for r in done if r.get("verdict") and best_answer(r)]
@@ -659,7 +668,7 @@ def make_api(r):
                 rec = r.record(n, item["qid"]) or {}
                 out.append({"qid": item["qid"], "title": item["title"], "topic": item["topic"],
                             "difficulty": item["difficulty"], "size": item["size"],
-                            "complete": bool(rec.get("complete")), "clean": bool(rec.get("clean")),
+                            "complete": bool(rec.get("complete")), "clean": was_clean(rec),
                             "best": (rec.get("verdict") or {}).get("best"),
                             "judge_score": (rec.get("verdict") or {}).get("best_score"),
                             "before": ((best_answer(rec) or {}).get("check", {}).get("score")

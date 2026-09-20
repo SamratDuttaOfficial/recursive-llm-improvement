@@ -344,6 +344,11 @@ dataset  7 training examples from rounds 1, 2 across 3 machines (avg 321 chars)
 
 Only the corpus needs merging. Fine-tuning and benchmarking then run once, on the machine with the GPU.
 
+A corpus written by an earlier version has none of these fields - no `host`, no `run`, no `kept`, no
+`clean` - and merges in exactly the same way. It trains as it always did and reports its machine as
+unknown; only the question and the answer are actually required of a row. Mixed old and new corpora in one
+folder are fine.
+
 ## Flags worth knowing
 
 Every flag below has a home in `config.json`; passing it overrides the file for that one run. All three
