@@ -107,19 +107,39 @@ def stamp(t=None):
 
 # ---------------------------------------------------------------- graceful shutdown
 class Stop:
-    """One process-wide stop flag. Ctrl-C sets it; every loop checks it and returns, every step has already
-    written its state, so re-running resumes exactly where it stopped. A second Ctrl-C exits immediately."""
-    flag = threading.Event()
+    """Two process-wide flags, so that Ctrl-C can be smooth.
+
+    Where the smooth stop has been armed - `Stop.smooth()`, called once there is work in flight worth
+    finishing - the first Ctrl-C only stops *new* work from starting: whatever is already running goes to
+    the end and is saved, so nothing is left half done. The second drops what is running; every finished
+    step is already on disk, so re-running resumes exactly there. The third quits on the spot.
+
+    Before that call, and in the scripts that never make it, the first Ctrl-C is the dropping one: there is
+    nothing worth draining while a download or a server start is all that is happening."""
+    flag = threading.Event()            # drop what is running
+    draining = threading.Event()        # start nothing new
     _cleanup = []
-    _hits = 0
+    _soft = False
+
+    @classmethod
+    def smooth(cls):
+        """Arm the smooth stop: from here on the first Ctrl-C drains instead of dropping."""
+        cls._soft = True
 
     @classmethod
     def set(cls):
+        cls.draining.set()
         cls.flag.set()
 
     @classmethod
     def is_set(cls):
+        """True when whatever is running should be dropped where it stands."""
         return cls.flag.is_set()
+
+    @classmethod
+    def winding_down(cls):
+        """True once a stop of either kind has been asked for: start nothing new."""
+        return cls.draining.is_set() or cls.flag.is_set()
 
     @classmethod
     def sleep(cls, secs):
@@ -141,19 +161,31 @@ class Stop:
 
     @classmethod
     def install(cls):
-        def handler(*_):
-            cls._hits += 1
-            if cls._hits == 1:
+        def interrupt(*_):
+            if cls._soft and not cls.draining.is_set():
+                cls.draining.set()
+                log("stop", "Ctrl-C: starting nothing new - what is already in flight will finish and be "
+                            "saved (Ctrl-C again to drop it and stop now)", "yellow")
+            elif not cls.flag.is_set():
                 cls.set()
-                log("stop", "Ctrl-C: finishing the step in flight and saving, then exiting; re-run to resume "
-                            "(Ctrl-C again quits immediately)", "yellow")
+                log("stop", "Ctrl-C: dropping what is running; every finished step is already on disk, "
+                            "re-run to resume (Ctrl-C again quits immediately)", "yellow")
             else:
-                log("stop", "second Ctrl-C: quitting now", "yellow")
+                log("stop", "quitting now", "yellow")
                 cls.run_cleanup()
                 os._exit(130)
-        signal.signal(signal.SIGINT, handler)
+
+        def terminate(*_):
+            """A supervisor asking the process to go does not want it to drain first."""
+            if cls.flag.is_set():
+                cls.run_cleanup()
+                os._exit(143)
+            cls.set()
+            log("stop", "termination requested: dropping what is running", "yellow")
+
+        signal.signal(signal.SIGINT, interrupt)
         if hasattr(signal, "SIGTERM"):
-            signal.signal(signal.SIGTERM, handler)
+            signal.signal(signal.SIGTERM, terminate)
         atexit.register(cls.run_cleanup)
 
 
@@ -401,7 +433,10 @@ class Gen:
         if s.t1 is None:
             s.t1 = time.time()
         if Stop.is_set():
-            return True
+            # Half an answer is not a short answer: handing back what has arrived so far would have it
+            # checked, scored and saved as though the model had finished. Drop the call instead - the
+            # step is simply not done, and re-running does it again.
+            raise Interrupted()
         if not s.guard or s.n - s.last < s.CHECK_EVERY:
             return False
         s.last = s.n
@@ -1169,7 +1204,7 @@ def common_state(backend=None, extra=None):
     g = gpu_status()
     st = {"t": time.time(), "boot": T0, "elapsed": time.time() - T0, "phase": dict(PHASE),
           "gpu": g, "stats": dict(STATS), "platform": platform.system(), "machine": platform.machine(),
-          "stopping": Stop.is_set(),
+          "stopping": Stop.winding_down(), "draining": Stop.draining.is_set() and not Stop.is_set(),
           "backend": {"kind": backend.kind, "status": backend.status(), "slots": backend.total_slots(),
                       "models": {r: e.get("id") for r, e in backend.entries.items()}} if backend else None}
     if extra:

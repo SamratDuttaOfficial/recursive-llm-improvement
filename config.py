@@ -56,7 +56,7 @@ DEFAULTS = {
 
     "corpus": {
         "questions_per_round": 24,
-        "rounds": 1,
+        "rounds": 0,
         "answer_tokens": 20000,
         "judge_tokens": 3000,
         "question_tokens": 4000,
@@ -71,7 +71,7 @@ DEFAULTS = {
         "exec_timeout": 25,
         "run_code": True,
         "ctx": 0,
-        "difficulty_mix": {"easy": 0.30, "hard": 0.25},
+        "difficulty_mix": {"harder": 0.40, "hardest": 0.30},
         "short_share": 0.6,
         "axis_weights": {"correctness": 0.45, "robustness": 0.2, "efficiency": 0.15, "style": 0.2},
     },
@@ -230,14 +230,17 @@ COMMENTS = {
               "them whole, never truncated, so this also decides how big the judge context has to be.\n"
               "`judge_weight` splits the winner decision between the judges and the programmatic\n"
               "checker (1 = judges alone, 0 = checker alone). Every rewritten answer goes into the\n"
-              "corpus - nothing here filters one out.",
+              "corpus - nothing here filters one out. `rounds` is how many exercise sets to\n"
+              "write in one run; 0, the default, means keep writing new ones until Ctrl-C.",
     "corpus.question_batch": "How many exercises to ask for per call. A small model cannot write a whole\n"
                              "set in one answer, so the round is filled a batch at a time.",
     "corpus.question_temp": "Sampling for the exercise writer, and the only thing keeping one set\n"
                             "different from the next - nothing it has already written is put back in\n"
                             "front of it. Turn these up for stranger exercises, down if the JSON starts\n"
                             "coming back malformed.",
-    "corpus.difficulty_mix": "Fractions of each round that are easy and hard; the rest are medium.",
+    "corpus.difficulty_mix": "Fractions of each round that are `harder` and `hardest`; the rest are\n"
+                             "`hard`. There is no easy band: the exercise writer is told that every\n"
+                             "exercise must be a hard one, and these only say how much harder.",
     "corpus.short_share": "Fraction of each round that is a short exercise; the rest are long.",
     "corpus.axis_weights": "How the four judge axes combine into one number when ranking answers.",
     "solvers": "The agents that answer each exercise, one entry each - add or remove entries to change\n"

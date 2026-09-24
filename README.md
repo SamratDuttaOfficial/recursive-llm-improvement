@@ -20,8 +20,11 @@ sudo, no PATH changes, no effect on any Python you use for other work. Everythin
 
 If you would rather use your own interpreter, `python run.py` still works and behaves identically.
 
-Ctrl-C at any moment is safe: the step in flight finishes or is dropped, everything already produced is on
-disk, and re-running the same command continues from exactly there.
+`run.py` does not stop on its own: a finished round is followed by a new set of exercises and it keeps
+going until you stop it. **Ctrl-C is a smooth stop** - nothing new is started, the exercises already in
+flight run to the end and are saved, and then it exits. A second Ctrl-C drops them instead, a third quits
+on the spot. Everything already produced is on disk whichever you press, and re-running the same command
+continues from exactly there.
 
 ## Three scripts, one job each
 
@@ -98,20 +101,45 @@ python pipeline.py --cycles 2
 
 ## Phase 1 - building the corpus (`run.py`)
 
-**The exercises.** The model is asked for a JSON array of Python exercises with a difficulty and size mix,
-each with the exact signature to implement, worked examples, and a list of what a correct answer must get
-right. Nothing may need more than **20,000 tokens** of answer - a short one takes a few hundred, a long one
-a few thousand. A round is filled **a batch at a time** (`--question-batch 6`) rather than in one call:
-asked for two dozen JSON objects at once a 0.8B model writes a handful and closes the array, and a set that
-does comply overruns the token ceiling and is cut off mid-object - either way the round ends far short.
+**The exercises, and how hard they are.** The model is asked for a JSON array of Python exercises, each
+with the exact signature to implement, worked examples, and a list of what a correct answer must get right.
+Nothing may need more than **20,000 tokens** of answer - a short one takes a few hundred, a long one a few
+thousand. A round is filled **a batch at a time** (`--question-batch 6`) rather than in one call: asked for
+two dozen JSON objects at once a 0.8B model writes a handful and closes the array, and a set that does
+comply overruns the token ceiling and is cut off mid-object - either way the round ends far short.
+
+**There is no easy band.** Left alone a small model writes fizzbuzz, and a corpus of fizzbuzz teaches
+nothing, so the exercise prompt does the work of raising the floor. The difficulty scale runs `hard` ->
+`harder` -> `hardest` and nothing below it exists. The writer is told what hardness is allowed to come from
+- a stated time or memory bound that rules out the obvious approach, a non-obvious structure (heaps,
+monotonic stacks, union-find, tries, interval or bitmask DP, binary search on the answer), requirements
+that pull against each other, an invariant to maintain across a whole sequence of operations, edge cases
+that are the real problem, or input that is streamed, malformed or too large for a second pass - and it
+must use at least two of them per exercise. It is also given the list of exercises it may never write
+(fizzbuzz, reverse a string, palindrome, fibonacci, two-sum, a Calculator class, anagrams, flatten a nested
+list, and the rest), the test to apply before writing one down (*if a correct solution is one
+standard-library call or a straightforward fifteen-line loop, it is too easy*), and one worked example -
+the sliding-window median in O(n log k) - to anchor the level. `corpus.difficulty_mix` in `config.json`
+only says how much of each round is `harder` and `hardest`; the rest is `hard`.
+
+Expect the scores to be lower than they were on easy exercises. That is the point: a 0.8B model that
+fails an interval-DP problem and then rewrites it under criticism produces a more useful training pair
+than one that nails another string reversal.
 
 Variety comes from **sampling, not from recall**. Nothing the model has already written goes back into its
 context; it is simply run hot - `question_temp 1.25`, `top_k 120`, `top_p 0.98`, `min_p 0.02`, all in
 `config.json` - and every batch is an independent draw. The only thing carried across is the set of titles
 already used, which is enforced here rather than argued about in the prompt. Turn the temperature up for
-stranger exercises, down if the JSON starts coming back malformed. When a round is finished the script asks
-whether to generate the next set (`--new` answers yes without asking, `--no-new` only finishes what is
-pending).
+stranger exercises, down if the JSON starts coming back malformed.
+
+**It runs until you stop it.** When a round is finished the next set is written straight away, and that
+goes on for as long as you leave it - `corpus.rounds` is 0 by default, which means no end. `--rounds 3`
+caps one run at three sets; `--no-new` finishes only what is already pending and then exits. The first
+Ctrl-C takes the rest of the queue away and waits for the exercises in flight: each one finishes its
+judges, its rewrite and its corpus row, so nothing is left half-answered and the log says how many it is
+waiting for. A second Ctrl-C drops them where they stand - a part-streamed answer is discarded rather than
+checked and saved as though the model had finished it - and re-running picks up at the exact sub-step that
+was interrupted.
 
 **Three answers.** Three solvers run concurrently on the same model with different sampling and different
 strengths - `careful` (temperature 0.25, edge cases first), `efficient` (0.7, complexity first) and
@@ -355,7 +383,8 @@ Every flag below has a home in `config.json`; passing it overrides the file for 
 scripts also take `--config PATH`, `--print-config` and `--init-config`.
 
 **`run.py`** `--generator base|latest|v2` who answers (judges stay on base) - `--questions 24` per round -
-`--rounds 3` rounds in one go - `--new` / `--no-new` - `--workers N` - `--slots N` -
+`--rounds 3` rounds in one go, 0 (the default) means until Ctrl-C - `--new` / `--no-new` - `--workers N` -
+`--slots N` -
 `--answer-tokens 20000` the ceiling for one answer - `--judge-weight 0.7` judges against checker -
 `--question-batch 6` exercises per generation call - `--question-temp 1.25` / `--question-top-k 120` /
 `--question-top-p` / `--question-min-p` how adventurous the exercise writer is -

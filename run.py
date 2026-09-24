@@ -6,7 +6,7 @@
 One command. It downloads Ollama if it is missing, pulls the model, starts a batched llama-server sized to
 the GPU, opens a live dashboard, and then, for every exercise:
 
-    the model writes a set of exercises  (a few per call, run hot, so that the sets differ)
+    the model writes a set of hard exercises  (a few per call, run hot, so that the sets differ)
       -> three solvers answer it independently, with different sampling and different strengths
       -> a static checker compiles, lints and actually runs each answer
       -> three judges see all three answers side by side and score them in JSON
@@ -15,9 +15,12 @@ the GPU, opens a live dashboard, and then, for every exercise:
       -> the rewrite is checked again and saved as the training pair, unless it came out worse than
          the answer it replaced, in which case that answer is kept instead
 
-Everything is written to disk the moment it is produced, so Ctrl-C is safe and re-running resumes at the
-exact sub-step that was interrupted. `--generator latest` answers with the newest fine-tuned model while the
-judges keep using the untouched base model.
+It does not stop on its own. A finished round is followed by a new set of exercises, and it keeps going
+until you press Ctrl-C; `--rounds N` caps it at N sets for one run. The first Ctrl-C is a smooth stop:
+nothing new is started, the exercises already in flight run to the end and are saved, and then it exits. A
+second one drops them. Everything is written to disk the moment it is produced either way, so re-running
+resumes at the exact sub-step that was interrupted. `--generator latest` answers with the newest fine-tuned
+model while the judges keep using the untouched base model.
 
 `config.json` decides the rest: which model, how many solvers, how many judges, what each of them is told,
 how much runs in parallel, every budget and every threshold. It is written on the first run, and a flag on
@@ -274,11 +277,11 @@ class Loop:
     # ------------------------------------------------ question set
     def question_user(s, need):
         a = s.a
-        easy = max(1, round(need * a.easy_share))
-        hard = max(1, round(need * a.hard_share))
+        harder = round(need * a.harder_share)
+        hardest = round(need * a.hardest_share)
         short = round(need * a.short_share)
-        return prompts.fill(prompts.QUESTION_USER, n=need, easy=easy, hard=hard,
-                            medium=max(0, need - easy - hard), short=short, long=need - short)
+        return prompts.fill(prompts.QUESTION_USER, n=need, hard=max(0, need - harder - hardest),
+                            harder=harder, hardest=hardest, short=short, long=need - short)
 
     def make_questions(s, n_round, count):
         """Write the exercise set a few at a time.
@@ -300,7 +303,7 @@ class Loop:
         batch = max(1, int(a.question_batch or 6))
         out, calls, barren = [], 0, 0
         limit = max(6, -(-count // batch) * 3)      # three shots at every batch before giving up
-        while len(out) < count and calls < limit and not Stop.is_set():
+        while len(out) < count and calls < limit and not Stop.winding_down():
             calls += 1
             need, before = min(batch, count - len(out)), len(out)
             phase("questions", "round " + str(n_round) + ": " + str(len(out)) + "/" + str(count) +
@@ -325,7 +328,7 @@ class Loop:
                 if isinstance(checks, str):
                     checks = [checks]
                 out.append({"qid": "r" + str(n_round).zfill(3) + "q" + str(len(out) + 1).zfill(3),
-                            "title": title, "difficulty": str(it.get("difficulty", "medium")),
+                            "title": title, "difficulty": str(it.get("difficulty", "hard")),
                             "size": str(it.get("size", "short")), "topic": str(it.get("topic", "general")),
                             "question": body, "checks": [str(c) for c in checks][:6]})
                 if len(out) >= count:
@@ -688,39 +691,25 @@ def make_api(r):
 
 # ---------------------------------------------------------------- what to do this run
 def decide_round(r, args):
-    """Resume an unfinished round, or start a new one - asking the user when it is ambiguous."""
+    """Where this run picks up: an unfinished round if there is one, otherwise a new set.
+
+    There is nothing to ask any more. The loop writes a new set after every finished round and runs until
+    Ctrl-C, so the answer to "another set?" is always yes unless `--no-new` says to finish only what is
+    already pending."""
     nums = r.round_nums()
     if nums:
-        last = nums[-1]
-        left = r.pending(last)
-        if left and not args.new:
-            log("plan", "round " + str(last) + " has " + str(len(left)) + " of " +
-                str(len(r.questions(last))) + " exercises left; resuming it", "bold")
+        last, left = nums[-1], r.pending(nums[-1])
+        if left and not args.force_new:
+            if args.new:
+                log("plan", "round " + str(last) + " still has " + str(len(left)) +
+                    " exercises left - finishing those first (--force-new skips them)", "yellow")
+            else:
+                log("plan", "round " + str(last) + " has " + str(len(left)) + " of " +
+                    str(len(r.questions(last))) + " exercises left; resuming it", "bold")
             return last, False
-        if left and args.new:
-            log("plan", "round " + str(last) + " still has " + str(len(left)) +
-                " exercises left - finish it first (re-run without --new), or pass --force-new", "yellow")
-            if not args.force_new:
-                return last, False
-    if args.new or args.force_new:
-        return (nums[-1] + 1 if nums else 1), True
-    if not nums:
-        return 1, True
-    if args.no_new:
+    if args.no_new and nums:
         return None, False
-    if not sys.stdin.isatty():
-        log("plan", "every round is finished and there is no terminal to ask; pass --new for another set")
-        return None, False
-    print("")
-    print("  Round " + str(nums[-1]) + " is finished (" + str(len(r.questions(nums[-1]))) +
-          " exercises, " + str(len(read_jsonl(r.corpus_path(nums[-1])))) + " answers in the corpus).")
-    try:
-        ans = input("  Generate a new set of " + str(r.a.questions) + " exercises? [Y/n] ").strip().lower()
-    except EOFError:
-        ans = "n"
-    if ans in ("", "y", "yes"):
-        return nums[-1] + 1, True
-    return None, False
+    return (nums[-1] + 1 if nums else 1), True
 
 
 # ---------------------------------------------------------------- main
@@ -736,10 +725,13 @@ def main():
     ap.add_argument("--questions", type=int, default=O, help="exercises per round")
     ap.add_argument("--question-batch", type=int, default=O,
                     help="how many exercises to ask for per call while filling a round")
-    ap.add_argument("--new", action="store_true", help="start a new round without asking")
-    ap.add_argument("--force-new", action="store_true", help="start a new round even if one is unfinished")
-    ap.add_argument("--no-new", action="store_true", help="only finish what is pending, never ask")
-    ap.add_argument("--rounds", type=int, default=O, help="how many rounds to run in one go")
+    ap.add_argument("--new", action="store_true",
+                    help="kept for older scripts: a new round is what happens anyway once one is finished")
+    ap.add_argument("--force-new", action="store_true",
+                    help="start a new round even if the last one still has exercises left")
+    ap.add_argument("--no-new", action="store_true", help="finish only what is already pending, then stop")
+    ap.add_argument("--rounds", type=int, default=O,
+                    help="how many rounds to run in one go; 0 (the default) keeps going until Ctrl-C")
     ap.add_argument("--workers", type=int, default=O, help="exercises in flight; 0 = fit to the GPU slots")
     ap.add_argument("--slots", type=int, default=O, help="llama-server parallel slots; 0 = fit to free VRAM")
     ap.add_argument("--backend", default=O, choices=["auto", "llama", "ollama"])
@@ -781,9 +773,10 @@ def main():
     a.solvers, a.judges = cfg.solvers, cfg.judges
     set_slots(len(a.solvers))
     a.axis_weights = cfg.get("corpus.axis_weights")
-    a.easy_share = cfg.get("corpus.difficulty_mix.easy", 0.3)
-    a.hard_share = cfg.get("corpus.difficulty_mix.hard", 0.25)
+    a.harder_share = cfg.get("corpus.difficulty_mix.harder", 0.4)
+    a.hardest_share = cfg.get("corpus.difficulty_mix.hardest", 0.3)
     a.short_share = cfg.get("corpus.short_share", 0.6)
+    a.rounds = max(0, int(a.rounds or 0))       # 0 = keep writing new sets until Ctrl-C
     if not cfg.get("corpus.run_code", True):
         a.no_exec = True
     if not cfg.get("ui.dashboard", True):
@@ -844,14 +837,20 @@ def main():
             report(r)
     threading.Thread(target=reporter, daemon=True).start()
 
+    # From here a Ctrl-C is worth draining rather than dropping: there are exercises in flight that are
+    # most of the way through, and letting them finish costs seconds and saves the work.
+    Stop.smooth()
     try:
-        for k in range(a.rounds):
-            if Stop.is_set():
+        made = 0
+        while not Stop.winding_down():
+            if made:
+                nums = r.round_nums()
+                n_round, is_new = ((nums[-1] + 1) if nums else 1), True
+            if not do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
                 break
-            if k > 0:
-                n_round, is_new = (r.round_nums()[-1] + 1), True
-            do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry)
-            is_new = True
+            made += 1
+            if a.rounds and made >= a.rounds:
+                break
     except Interrupted:
         pass
     except KeyboardInterrupt:
@@ -861,21 +860,30 @@ def main():
         report(r, final=True)
         backend.stop()
 
+    total = sum(len(read_jsonl(r.corpus_path(n))) for n in r.round_nums())
+    held = str(total) + " answers across " + str(len(r.round_nums())) + " rounds"
     if Stop.is_set():
-        log("stop", "stopped cleanly - every finished step is on disk. Re-run the same command to resume.", "yellow")
+        log("stop", "stopped - every finished step is on disk, " + held +
+            ". Re-run the same command to resume.", "yellow")
+    elif Stop.winding_down():
+        log("stop", "stopped cleanly - everything in flight finished and was saved, " + held +
+            ". Re-run the same command to carry on.", "green")
     else:
-        total = sum(len(read_jsonl(r.corpus_path(n))) for n in r.round_nums())
-        log("done", "corpus now holds " + str(total) + " answers across " +
-            str(len(r.round_nums())) + " rounds", "green")
-        log("next", "train on it with:  python finetune.py        then measure:  python benchmark.py", "bold")
+        log("done", "corpus now holds " + held, "green")
+    log("next", "train on it with:  python finetune.py        then measure:  python benchmark.py", "bold")
 
 
 def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
+    """One set of exercises, from writing them to filing the answers. False means: do not start another."""
     if is_new and not r.questions(n_round):
         qs = loop.make_questions(n_round, r.a.questions)
+        if Stop.winding_down() and len(qs) < r.a.questions:
+            log("stop", "stopped while round " + str(n_round) + " was being written; the part-written set "
+                        "is dropped rather than saved short", "yellow")
+            return False
         if not qs:
             log("warn", "the model produced no usable exercises; stopping", "yellow")
-            return
+            return False
         write_json(os.path.join(r.round_dir(n_round), "questions.json"), qs)
         write_json(os.path.join(r.round_dir(n_round), "info.json"),
                    {"generator": gen_entry["id"], "judge": judge_entry["id"], "created": time.time(),
@@ -884,11 +892,13 @@ def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
                                                 "count": len(qs), "created": time.time()})
         r.save_meta()
         log("questions", "round " + str(n_round) + ": " + str(len(qs)) + " exercises written", "green")
+    if Stop.winding_down():
+        return False
 
     todo = r.pending(n_round)
     if not todo:
         log("round", "round " + str(n_round) + " is already complete")
-        return
+        return True
     phase("solving", "round " + str(n_round) + ": " + str(len(todo)) + " exercises")
     log("round", "round " + str(n_round) + ": " + str(len(todo)) + " exercises to do, " +
         str(workers) + " in flight (" + str(len(r.a.solvers)) + " answers + " + str(len(r.a.judges)) +
@@ -896,12 +906,27 @@ def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
     t0, done = time.time(), 0
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(loop.solve, n_round, q): q for q in todo}
+        settled = threading.Event()
+
+        def drain():
+            """Take the queue away the moment a stop is asked for. Waiting until the next exercise finishes
+            is too late - the pool starts the one behind it in the same instant. Cancelling only touches
+            what has not begun; the exercises already running are left alone to finish and save."""
+            while not settled.wait(0.2):
+                if Stop.winding_down():
+                    dropped = sum(1 for f in futs if f.cancel())
+                    still = sum(1 for f in futs if f.running())
+                    log("stop", "round " + str(n_round) + ": " + str(dropped) + " exercises not started" +
+                        (", " + str(still) + " dropped where they stand" if Stop.is_set() else
+                         "; waiting for the " + str(still) + " in flight to finish and be saved"), "yellow")
+                    return
+        threading.Thread(target=drain, daemon=True).start()
         try:
             for f in cf.as_completed(futs):
                 q = futs[f]
                 try:
                     rec = f.result()
-                except Interrupted:
+                except (Interrupted, cf.CancelledError):
                     continue
                 except Exception as e:
                     log("warn", q["qid"] + " failed: " + repr(e)[:160], "yellow")
@@ -920,9 +945,12 @@ def do_round(r, loop, n_round, is_new, workers, gen_entry, judge_entry):
                     "green" if rec["clean"] and rec.get("kept") != "original" else "yellow")
         except (KeyboardInterrupt, Interrupted):
             Stop.set()
+        finally:
+            settled.set()
         if Stop.is_set():
             for f in futs:
                 f.cancel()
+    return not Stop.winding_down()
 
 
 def banner(a, r):
@@ -940,6 +968,8 @@ def banner(a, r):
              " per slot (every answer in full, never truncated)",
              "  checker    compile + AST + ruff" + ("" if not a.no_exec else " (execution off)") +
              ", scoring only - no answer is filtered out",
+             "  loop       " + (str(a.rounds) + " round(s) and then stop" if a.rounds else
+                                "a new set of exercises after every finished round, until Ctrl-C"),
              "  machine    " + (g["name"] + " " + str(g["total"]) + " MB " +
                                 ("unified" if g.get("unified") else "VRAM") if g else "no GPU detected"),
              ""]

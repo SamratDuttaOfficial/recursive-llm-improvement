@@ -54,14 +54,37 @@ def _list_and(items, joiner="and"):
 
 
 # ---------------------------------------------------------------- question generation
-QUESTION_SYSTEM = """You write programming exercises for a Python benchmark. You are precise and terse.
+QUESTION_SYSTEM = """You write hard programming exercises for a Python benchmark. You are precise and terse.
 
-Every exercise must:
+These are not tutorial exercises. Every one of them has to be genuinely difficult: a competent Python
+programmer should have to stop and think, and a careless one should get it wrong. The difficulty must come
+from the problem itself - never from language trivia, never from an ambiguous question. A hard exercise has
+an exact specification and a hard solution.
+
+Make each one hard in at least two of these ways:
+- a stated bound on time or memory rules out the obvious approach
+- the answer needs a non-obvious structure or technique: heaps, monotonic stacks, union-find, tries,
+  interval or bitmask DP, binary search on the answer, topological order, prefix sums, meet in the middle
+- two requirements pull against each other, so satisfying one naively breaks the other
+- an invariant has to be maintained across a whole sequence of operations, not computed once at the end
+- the edge cases are where the problem really lives: ties, overlaps, empty groups, cycles, overflow,
+  a boundary that is off by one, input arriving in the worst possible order
+- the input is awkward: streamed and unseekable, malformed in ways that must be reported precisely, or
+  large enough that a second pass over it is not allowed
+
+Never write any of these, or the same problem with a new story around it: fizzbuzz, reverse a string,
+palindrome check, fibonacci, factorial, the sum or maximum or average of a list, counting vowels or words,
+bubble sort, two-sum, a temperature or unit converter, a Calculator class, primality testing, anagram check,
+flattening a nested list. They stay too easy however they are dressed up.
+
+The test to apply before writing one down: if a correct solution is one standard-library call, or a
+straightforward loop of fifteen lines, it is too easy - make it harder or throw it away.
+
+Every exercise must still:
 - be solvable in pure Python """ + PY_VERSION + """ using only the standard library
 - be completely self-contained: all inputs, constraints and expected behaviour stated in the question itself
 - have an objectively checkable answer (a function with a stated signature, or a small program)
-- be answerable in at most {budget} tokens of code and explanation - a short one in a few
-  hundred, a long one in a few thousand, but never more than that ceiling
+- be answerable in at most {budget} tokens of code and explanation - hard, but not endless
 - avoid anything needing the internet, a database, a GPU, a GUI, or a third-party package
 
 You never write the solution. You only write the exercise.
@@ -69,31 +92,39 @@ You never write the solution. You only write the exercise.
 Answer with a JSON array and nothing else - no prose before it, no code fence around it.
 Each element is an object with exactly these keys:
   "title":       3-8 words, lowercase, hyphenated, unique
-  "difficulty":  "easy" | "medium" | "hard"
+  "difficulty":  "hard"    - a strong programmer gets it right, carefully, on the first attempt
+                 "harder"  - needs the right algorithm; the naive version is too slow or quietly wrong
+                 "hardest" - needs the right algorithm and an invariant or edge case that is easy to miss
   "size":        "short" (a single function, ~20-60 lines) | "long" (several cooperating functions, a
                  class or a small module, ~100-400 lines - big enough to be a real piece of work)
   "topic":       one of: algorithms, data-structures, strings, parsing, math, recursion, dynamic-programming,
                  iterators-generators, decorators, classes-oop, error-handling, file-formats, concurrency,
                  dates-times, regex, functional, caching, state-machines, numerical, text-processing
   "question":    the exercise itself, 60-250 words, with the exact function or class signature to implement,
-                 the input constraints, and at least two worked input/output examples
-  "checks":      2-5 short sentences naming what a correct solution must get right (edge cases, complexity,
-                 error behaviour). These are hints for graders, not part of the question text.
+                 the input constraints, the complexity bound where one is what makes it hard, and at least
+                 two worked input/output examples - one of them an edge case the obvious answer gets wrong
+  "checks":      2-5 short sentences naming what a correct solution must get right (the edge cases, the
+                 complexity bound, the error behaviour). These are hints for graders, not part of the
+                 question text.
 
-Example of one element (follow this shape exactly):
-{"title": "merge-overlapping-intervals", "difficulty": "medium", "size": "short", "topic": "algorithms",
- "question": "Implement `merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]`. Each tuple is a closed interval (start, end) with start <= end. Return the intervals merged so that no two overlap or touch, sorted by start. The input may be unsorted and may be empty. Intervals that merely touch, such as (1, 2) and (2, 5), count as overlapping and must merge into (1, 5). Example: merge_intervals([(5, 7), (1, 3), (2, 4)]) returns [(1, 4), (5, 7)]. Example: merge_intervals([]) returns [].",
- "checks": ["Sorts before merging rather than assuming order.", "Treats touching intervals as overlapping.", "Returns a new list and does not mutate the input.", "Runs in O(n log n)."]}
+Example of one element - this is the level to aim at, and the shape to follow exactly:
+{"title": "sliding-window-median", "difficulty": "harder", "size": "short", "topic": "data-structures",
+ "question": "Implement `running_median(nums: list[int], k: int) -> list[float]`. Return the median of every contiguous window of length k, in order, as floats: for odd k the middle value, for even k the mean of the two middle values. Raise ValueError if k < 1 or k > len(nums). The whole call must run in O(n log k), so sorting each window is not acceptable - maintain the window incrementally, for instance with two heaps and lazy deletion. Example: running_median([1, 3, -1, -3, 5, 3, 6, 7], 3) returns [1.0, -1.0, -1.0, 3.0, 5.0, 6.0]. Example: running_median([2, 4, 6, 8], 4) returns [5.0].",
+ "checks": ["Rebalances the two halves after every slide, including when the value leaving the window is the one on the boundary.", "Survives duplicate values, which lazy deletion makes easy to discard twice.", "Even k averages the two middle values and returns a float, not an int.", "Runs in O(n log k), not O(n k log k)."]}
 
 Output: a JSON array of exercise objects. Nothing else."""
 
-QUESTION_USER = """Write {n} Python exercises.
+QUESTION_USER = """Write {n} hard Python exercises.
 
-Mix of difficulty: about {easy} easy, {medium} medium, {hard} hard.
+Mix of difficulty: about {hard} hard, {harder} harder, {hardest} hardest. None of them easy.
 Mix of size: about {short} short and {long} long.
 Spread them across different topics - do not write several exercises on the same topic.
 Reach for something you would not think of first: an unusual domain, an awkward constraint, a shape of
 problem that is not the textbook one.
+
+For each one, before you write it down, answer two questions to yourself: what makes this hard, and what
+does the careless solution get wrong? If there is no good answer to either, the exercise is too easy -
+replace it with a harder one.
 
 Output the JSON array now."""
 

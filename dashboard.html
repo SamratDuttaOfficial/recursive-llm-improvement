@@ -255,7 +255,7 @@ function setOffline(off) { $("#offline").hidden = !off; $("#dot").className = "d
 function header() {
   const s = state;
   $("#phaseChip").textContent = (s.phase && s.phase.name ? s.phase.name : s.kind) +
-    (s.stopping ? " - stopping" : "");
+    (s.draining ? " - finishing what is in flight" : s.stopping ? " - stopping" : "");
   $("#phaseChip").className = "chip " + (s.stopping ? "warn" : "acc");
   $("#subtitle").textContent = [s.phase && s.phase.detail, s.run ? "run " + s.run : ""].filter(Boolean).join("  -  ");
   $("#elapsedChip").textContent = fmtT(s.elapsed || 0);
@@ -300,7 +300,9 @@ function configCard(s) {
     add("generator / judges", (c.generator || "?") + "  /  " + (c.judge_model || "?"));
     add("solvers", (c.solvers || []).map(x => x.name + " (t=" + x.temperature + ", top_k=" + x.top_k + ")").join(", "));
     add("judges", (c.judges || []).map(x => x.name + " (t=" + x.temperature + ", top_k=" + x.top_k + ")").join(", "));
-    add("exercises per round", c.questions);
+    add("exercises per round", c.questions + " hard ones, written " + (c.question_batch || 6) + " per call");
+    add("rounds", c.rounds ? c.rounds + " this run, then stop"
+                           : "a new set of exercises after every finished round, until Ctrl-C");
     add("answer ceiling", c.answer_tokens + " tokens");
     add("who picks the winner", "judges " + Math.round(c.judge_weight * 100) + "%, checker " +
       Math.round((1 - c.judge_weight) * 100) + "%");
