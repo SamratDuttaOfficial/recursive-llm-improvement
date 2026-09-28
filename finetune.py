@@ -25,6 +25,9 @@ import prompts
 CONVERT_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
 PHASES = ["dataset", "deps", "base", "train", "merge", "gguf", "register"]
 LIVE_TRAIN = {"steps": [], "state": {}, "log": []}
+# How running out of memory reads from PyTorch (CUDA, MPS) and from MLX, whose Metal driver says "Insufficient
+# Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)".
+OOM = re.compile(r"out of memory|outofmemory|insufficient memory|metal::malloc", re.I)
 
 # Which config key backs each flag. A flag the user actually passes wins; anything else comes from the file.
 CONFIG_MAP = {
@@ -303,7 +306,9 @@ def run_training(a, base_hf, data, out_dir, prog, save):
     ladder = [{"seq_len": a.seq_len, "batch": a.batch, "load_4bit": a.load_4bit},
               {"seq_len": max(512, a.seq_len // 2), "batch": 1, "load_4bit": a.load_4bit},
               {"seq_len": max(512, a.seq_len // 2), "batch": 1, "load_4bit": True}]
-    start = prog.get("train_attempt", 0)
+    if prog.get("backend") == "mlx":
+        ladder = ladder[:2]     # MLX training has no 4-bit mode, so a third rung would repeat the second
+    start = min(prog.get("train_attempt", 0), len(ladder) - 1)
     for attempt in range(start, len(ladder)):
         if Stop.is_set():
             raise Interrupted()
@@ -335,14 +340,14 @@ def run_training(a, base_hf, data, out_dir, prog, save):
             if Stop.is_set():
                 kill_tree(p)
                 break
+            if OOM.search(line):        # raw or inside a PROGRESS event: the worker reports errors both ways
+                oom = True
             if line.startswith("PROGRESS "):
                 ev = json.loads(line[9:])
                 handle_progress(ev, prog, save, t0)
             else:
                 LIVE_TRAIN["log"].append(line[:300])
                 del LIVE_TRAIN["log"][:-200]
-                if re.search(r"out of memory|CUDA out of memory|MPS backend out of memory", line, re.I):
-                    oom = True
                 if time.time() - t_last > 30:
                     t_last = time.time()
                     log("train", line[:150])
@@ -357,7 +362,8 @@ def run_training(a, base_hf, data, out_dir, prog, save):
         if oom and attempt + 1 < len(ladder):
             log("warn", "out of memory - retrying with smaller settings", "yellow")
             continue
-        sys.exit("training failed (exit " + str(rc) + "); the full output is in logs/train.log")
+        why = ", out of memory at seq " + str(cfg["seq_len"]) if oom else ""
+        sys.exit("training failed (exit " + str(rc) + why + "); the full output is in logs/train.log")
     return False
 
 
@@ -376,15 +382,22 @@ def handle_progress(ev, prog, save, t0):
             eta = el / st * (mx - st) if mx and st else 0
             log("train", "step " + str(st) + "/" + str(mx) + "  loss " +
                 (format(ev["loss"], ".4f") if ev.get("loss") is not None else "-") +
-                "  epoch " + str(ev.get("epoch", "?")) + "  eta " + fmt_t(eta))
+                "  epoch " + str(ev.get("epoch", "?")) + "  eta " + fmt_t(eta) +
+                ("  peak mem " + format(ev["peak_gb"], ".1f") + " GB" if ev.get("peak_gb") else ""))
             save()
+    elif kind == "val":
+        if ev.get("loss") is not None:
+            log("train", "validation loss " + format(ev["loss"], ".4f") + " at step " + str(ev.get("step")))
+    elif kind == "warn":
+        log("warn", str(ev.get("msg"))[:300], "yellow")
     elif kind == "checkpoint":
         prog["last_checkpoint"] = ev.get("step")
         save()
         log("train", "checkpoint at step " + str(ev.get("step")) + " (a Ctrl-C here loses nothing)")
     elif kind == "setup":
         LIVE_TRAIN["state"].update(device=ev.get("device"), gpu=ev.get("gpu"))
-        log("train", "device " + str(ev.get("device")) + " - " + str(ev.get("gpu", "")))
+        log("train", "device " + str(ev.get("device")) + " - " + str(ev.get("gpu", "")) +
+            ("; linear attention " + ev["recurrence"] if ev.get("recurrence") else ""))
     elif kind == "model":
         LIVE_TRAIN["state"].update(trainable=ev.get("trainable"), total=ev.get("total"))
         log("train", "LoRA on " + ", ".join(ev.get("targets", [])) + ": " +

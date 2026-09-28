@@ -199,10 +199,16 @@ LoRA (rank 32, alpha 64, 3 epochs, cosine schedule) over the corpus in ChatML fo
 into the base weights and converted to GGUF so the next round can be served by the same `llama-server`.
 
 - **NVIDIA / CPU**: PyTorch + PEFT, bf16, gradient checkpointing, resumed from the last `checkpoint-N`.
-- **Apple silicon**: `mlx-lm` LoRA on the unified-memory GPU, resumed from the last adapter file.
+- **Apple silicon**: `mlx-lm` LoRA on the unified-memory GPU, resumed from the last saved adapter at the
+  example it had reached. mlx-lm trains Qwen3.5's linear-attention layers one token at a time, which needs
+  several GB per layer and ran a 2048-token example out of memory, so `train_worker.py` swaps in a chunked
+  version of the same recurrence - after checking it against mlx-lm's own on the machine, and keeping mlx-lm's
+  if they disagree. The adapter is merged into the original Hugging Face files rather than with `mlx_lm fuse`,
+  whose output is in MLX's layout and cannot be converted to GGUF.
 
 The right stack is installed automatically for whichever machine you are on. Out of memory is not a failure:
-the sequence length halves, then the base drops to 4-bit, and training restarts from the last checkpoint.
+the sequence length halves, then (PyTorch only) the base drops to 4-bit, and training restarts from the last
+checkpoint.
 The base model is also converted to GGUF at the same precision, so the benchmark compares like with like.
 
 Seven phases - `dataset, deps, base weights, train, merge, gguf, register` - each recorded as it completes.
