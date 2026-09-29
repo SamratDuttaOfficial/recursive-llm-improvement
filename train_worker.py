@@ -4,13 +4,13 @@ import torch / peft / mlx. `finetune.py` starts it, reads its PROGRESS lines and
 
 Two backends, chosen by the machine:
   cuda / cpu     - transformers + PEFT LoRA, bf16, gradient checkpointing, resumed from the last checkpoint
-  apple silicon  - mlx-lm LoRA on the unified-memory GPU, in this process, resumed from the last adapter it
-                   saved and merged into the base model's own Hugging Face files
+  apple silicon  - MLX LoRA on the unified-memory GPU in a training loop of its own, sized to the memory that
+                   is free, resumed from the last adapter it saved and merged into the base model's own files
 
 Both print one JSON PROGRESS line per logging step so the dashboard can draw the loss curve. Everything here
 is idempotent: killed at any point, the next start continues.
 """
-import argparse, json, math, os, re, shutil, sys, time
+import argparse, json, math, os, re, shutil, subprocess, sys, time
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -122,18 +122,22 @@ def train_torch(a):
 
 
 # ---------------------------------------------------------------- Apple silicon / MLX
-# Most of Qwen3.5's layers are linear attention (Gated DeltaNet), and mlx-lm's fused Metal kernel for them has
-# no backward pass. The model therefore asks for `use_kernel=not self.training`, and every training step goes
-# through `gated_delta_ops`: a Python loop with one step per token. Backprop through that loop keeps two
-# 16x128x128 float32 states per token per layer - over 4 GiB for one layer of a 2048-token example, gradient
-# checkpointing or not - and builds tens of thousands of tiny ops. That ran a MacBook out of memory at step 6,
-# at 20-70 s a step. `chunked_gated_delta` computes the same recurrence 64 tokens at a time with matrix
-# products (the chunkwise form flash-linear-attention and transformers use), so backprop keeps one state per
-# chunk. It replaces mlx-lm's loop only after agreeing with it, values and gradients, on the machine itself.
+# The MLX path runs its own training loop instead of mlx-lm's trainer, so that everything deciding how much
+# memory a step needs is sized here - and measured before training starts:
+#   - Qwen3.5's linear-attention (Gated DeltaNet) layers. mlx-lm's fused kernel for them has no backward pass,
+#     so training goes through `gated_delta_ops`, a Python loop with one step per token whose backprop keeps two
+#     16x128x128 float32 states per token per layer. `chunked_gated_delta` computes the same recurrence 64
+#     tokens at a time; where it does not agree with mlx-lm, mlx-lm's loop runs under checkpointing instead.
+#   - The output layer. A 248k-token vocabulary makes one 2048-token example's logits 1 GB in bf16, and the
+#     loss's backward pass holds several copies; the loss here takes the vocabulary SLICE tokens at a time.
+#   - Every decoder layer runs under gradient checkpointing.
+#   - MLX sizes itself by the GPU working set, about 3/4 of RAM, which on a busy Mac is far more than is free.
+#     It is held to what is free, and the sequence length is the longest whose measured step fits.
 
 mx = None               # mlx.core, bound by train_mlx: MLX exists only on Apple silicon
-CHUNK = 64
-CHUNK_CALLS = [0]       # how many times training went through the chunked recurrence
+CHUNK = 64              # tokens per piece of the linear-attention recurrence
+SLICE = 256             # tokens per piece of the vocabulary-wide loss
+CHUNK_CALLS = [0]       # how many times training went through the replaced recurrence
 
 
 def _unit_lower_inverse(L):
@@ -206,10 +210,25 @@ def chunked_gated_delta(q, k, v, g, beta, state=None):
     return mx.moveaxis(y, 1, 2).astype(out_dtype), S
 
 
-def _check_chunked(ops):
-    """Worst relative difference between chunked_gated_delta and mlx-lm's loop, over both results and the
-    gradients of all six inputs, on a problem with padding, repeated key heads, a starting state and decays
-    close to zero."""
+def _checkpointed(ops):
+    """mlx-lm's own per-token loop, 64 tokens at a time under gradient checkpointing, so backprop keeps one state
+    per 64 tokens instead of one per token. The fallback when chunked_gated_delta does not agree with mlx-lm."""
+    def run(q, k, v, g, beta, state=None, mask=None):
+        if state is None:
+            state = mx.zeros((q.shape[0], v.shape[-2], v.shape[-1], q.shape[-1]), dtype=mx.float32)
+        ys = []
+        for s in range(0, q.shape[1], CHUNK):
+            m = None if mask is None else mask[:, s:s + CHUNK]
+            piece = mx.checkpoint(lambda *xs, m=m: ops(*xs, m))
+            y, state = piece(*(x[:, s:s + CHUNK] for x in (q, k, v, g, beta)), state)
+            ys.append(y)
+        return mx.concatenate(ys, axis=1), state
+    return run
+
+
+def _disagreement(ops, candidate):
+    """Worst relative difference between `candidate` and mlx-lm's loop, over both results and the gradients of
+    all six inputs, on a problem with padding, repeated key heads, a starting state and decays close to zero."""
     B, T, Hk, Hv, Dk, Dv = 2, 150, 2, 4, 32, 16
     mx.random.seed(7)
     unit = lambda x: x / mx.sqrt((x * x).sum(-1, keepdims=True))      # the model L2-normalises q and k
@@ -227,34 +246,180 @@ def _check_chunked(ops):
     def diff(a, b):
         return (mx.abs(a - b).max() / (mx.abs(a).max() + 1e-6)).item()
 
-    worst = [diff(a, b) for a, b in zip(ops(*args), chunked_gated_delta(*args))]
-    grads = [mx.grad(loss(fn), argnums=list(range(6)))(*args) for fn in (ops, chunked_gated_delta)]
+    worst = [diff(a, b) for a, b in zip(ops(*args), candidate(*args))]
+    grads = [mx.grad(loss(fn), argnums=list(range(6)))(*args) for fn in (ops, candidate)]
     return max(worst + [diff(a, b) for a, b in zip(*grads)])
 
 
-def install_chunked_recurrence():
-    """Swap mlx-lm's per-token training loop for chunked_gated_delta once the two agree here.
-    Returns (installed, what to report)."""
+def install_recurrence():
+    """Replace mlx-lm's per-token training loop for linear attention with a memory-light one: the chunked
+    recurrence when it agrees with mlx-lm on this machine, mlx-lm's own loop under checkpointing otherwise.
+    Returns what is in place, for the log."""
     try:
         from mlx_lm.models import gated_delta
         ops = gated_delta.gated_delta_ops
     except Exception as e:
-        return False, "this mlx-lm has no gated_delta_ops to replace (" + type(e).__name__ + ")"
+        return "mlx-lm's own loop (there is no gated_delta_ops to replace: " + type(e).__name__ + ")"
+    fallback, chunked = _checkpointed(ops), False
     try:
-        err = _check_chunked(ops)
+        err = _disagreement(ops, chunked_gated_delta)
+        chunked = err < 1e-3
+        how = ("chunked, agrees with mlx-lm to " + format(err, ".0e") if chunked else
+               "chunked disagreed with mlx-lm (" + format(err, ".1e") + ")")
     except Exception as e:
-        return False, "the self-check could not run: " + repr(e)[:200]
-    if not err < 1e-3:
-        return False, "the self-check disagreed with mlx-lm (relative difference " + format(err, ".1e") + ")"
+        how = "chunked could not be checked (" + repr(e)[:160] + ")"
 
     def patched(q, k, v, g, beta, state=None, mask=None):
-        if mask is not None or g.ndim != 3:     # padded batches and per-channel decay: mlx-lm's own loop
-            return ops(q, k, v, g, beta, state, mask)
         CHUNK_CALLS[0] += 1
-        return chunked_gated_delta(q, k, v, g, beta, state)
+        if chunked and mask is None and g.ndim == 3:
+            return chunked_gated_delta(q, k, v, g, beta, state)
+        return fallback(q, k, v, g, beta, state, mask)
 
     gated_delta.gated_delta_ops = patched       # gated_delta_update looks it up by name on every call
-    return True, "chunked (agrees with mlx-lm to " + format(err, ".0e") + ")"
+    return how if chunked else "mlx-lm's loop under checkpointing, 64 tokens at a time - " + how
+
+
+def _mem(name):
+    """An MLX memory call by name: top-level in current MLX, under mx.metal in older releases."""
+    return getattr(mx, name, None) or getattr(getattr(mx, "metal", None), name, None)
+
+
+def _free_bytes():
+    """Memory macOS could hand this process now: its free, inactive, purgeable and speculative pages."""
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = int(re.search(r"page size of (\d+)", vm).group(1))
+        pages = re.findall(r"Pages (?:free|inactive|purgeable|speculative):\s+(\d+)", vm)
+        return page * sum(int(p) for p in pages) if pages else None
+    except Exception:
+        return None
+
+
+def _memory_budget():
+    """The bytes this run may use: what is free right now less 2 GB for everything else, and no more than the GPU
+    working set. MLX otherwise goes by the working set alone - 27 GB on a 36 GB Mac, which on a busy machine is
+    twice what is free - and keeps freed buffers cached up to it. The limit, and a cache a quarter its size,
+    are set on MLX. Returns (budget or None when nothing could be read, what was read)."""
+    info_fn = _mem("device_info")
+    try:
+        info = info_fn() if info_fn else {}
+    except Exception:
+        info = {}
+    ram = int(info.get("memory_size") or 0)
+    working = int(info.get("max_recommended_working_set_size") or 0) or int(ram * 0.75)
+    free = _free_bytes()
+    if free is None and not working:
+        return None, {"ram": ram, "working": working, "free": free}
+    budget = working if free is None else max(2 << 30, min(working or free, free - (2 << 30)))
+    for name, value in (("set_memory_limit", budget), ("set_cache_limit", budget // 4)):
+        fn = _mem(name)
+        if fn:
+            try:
+                fn(value)
+            except Exception:
+                pass
+    return budget, {"ram": ram, "working": working, "free": free}
+
+
+def _memory_now():
+    """GB in use, in MLX's buffer cache, and at the peak since the last call - which this call resets."""
+    def get(name):
+        fn = _mem(name)
+        return round(fn() / 2 ** 30, 2) if fn else None
+    now = (get("get_active_memory"), get("get_cache_memory"), get("get_peak_memory"))
+    reset = _mem("reset_peak_memory")
+    if reset:
+        reset()
+    return now
+
+
+def _fit_length(measure, want, budget):
+    """The longest sequence, at most `want` tokens, whose training step fits in `budget` bytes. Real steps are
+    measured at 256 and 512 tokens, the line through them is extended to 85% of the budget, and the length that
+    gives is measured too and stepped down until it fits. `measure(n)` returns a step's peak bytes, or inf when
+    it ran out of memory. Returns (length, or 0 when not even the shortest fits; {length: peak bytes})."""
+    peaks = {}
+    lo, hi = min(want, 256), min(want, 512)
+    for n in (lo, hi):
+        if n not in peaks:
+            peaks[n] = measure(n)
+    if peaks[lo] > budget:
+        return 0, peaks
+    slope = (peaks[hi] - peaks[lo]) / (hi - lo) if hi > lo else 0.0
+    guess = want if slope <= 0 else hi + int((0.85 * budget - peaks[hi]) / slope)
+    n = want if guess >= want else max(lo, guess // 64 * 64)
+    while True:
+        if n not in peaks:
+            peaks[n] = measure(n)
+        if peaks[n] <= 0.9 * budget or n <= lo:
+            return n, peaks
+        n = max(lo, (n * 3 // 4) // 64 * 64)
+
+
+def _ce_sum(logits, targets):
+    logits = logits.astype(mx.float32)
+    return (mx.logsumexp(logits, axis=-1) - mx.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]).sum()
+
+
+def _make_loss(model, sample):
+    """The training loss - mean cross-entropy over an example's tokens - from the model's hidden states, with the
+    vocabulary taken SLICE tokens at a time under checkpointing, so the full logits never exist at once. Falls
+    back to the model's own logits when its output layer cannot be split off and shown to give the same logits
+    on `sample`. Returns (loss(model, tokens), what it does, for the log)."""
+    def whole(model, tokens):
+        return _ce_sum(model(tokens[:, :-1]), tokens[:, 1:]) / (tokens.shape[1] - 1)
+
+    try:
+        inner = model["language_model"] if "language_model" in model else model     # Qwen3.5 wraps its text model
+        body = inner["model"]
+        head = inner["lm_head"] if "lm_head" in inner else body["embed_tokens"].as_linear
+        model.eval()
+        ref = model(sample).astype(mx.float32)
+        diff = (mx.abs(ref - head(body(sample)).astype(mx.float32)).max() / (mx.abs(ref).max() + 1e-6)).item()
+    except Exception as e:
+        return whole, "the whole vocabulary at once (" + type(e).__name__ + " splitting off the output layer)"
+    finally:
+        model.train()
+    if not diff < 1e-2:
+        return whole, ("the whole vocabulary at once (the split-off output layer differed by " +
+                       format(diff, ".0e") + ")")
+
+    def sliced(model, tokens):
+        targets = tokens[:, 1:]
+        h = body(tokens[:, :-1])
+        total = mx.array(0.0, dtype=mx.float32)
+        for s in range(0, targets.shape[1], SLICE):
+            part = mx.checkpoint(lambda x, t=targets[:, s:s + SLICE]: _ce_sum(head(x), t))
+            total = total + part(h[:, s:s + SLICE])
+        return total / targets.shape[1]
+    return sliced, "the vocabulary " + str(SLICE) + " tokens at a time"
+
+
+def _checkpoint_layers(model):
+    """Gradient checkpointing for every decoder layer (they share one class): a layer's activations are recomputed
+    during backprop instead of kept. mlx-lm's `grad_checkpoint`, restated so it does not hang on its trainer."""
+    cls = type(model.layers[0])
+    if getattr(cls, "_checkpointed", False):
+        return
+    call = cls.__call__
+
+    def checkpointed(self, *args, **kwargs):
+        def inner(params, *args, **kwargs):
+            self.update(params)
+            return call(self, *args, **kwargs)
+        return mx.checkpoint(inner)(self.trainable_parameters(), *args, **kwargs)
+
+    cls.__call__ = checkpointed
+    cls._checkpointed = True
+
+
+def _encode(tokenizer, text):
+    """Token ids for one training text, ending in the end-of-sequence token as mlx-lm's datasets do."""
+    ids = list(tokenizer.encode(text))
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None and (not ids or ids[-1] != eos):
+        ids.append(eos)
+    return ids
 
 
 def _lr_schedule(lr, updates, done):
@@ -295,35 +460,27 @@ def _write_json(path, obj):
 
 
 def train_mlx(a):
-    """mlx-lm's LoRA trainer on the unified-memory GPU, run in this process so the recurrence patch applies
-    and progress arrives as numbers instead of console text. Resumes from the last adapter it saved, then
-    merges it into the base model's own files."""
+    """LoRA on the unified-memory GPU with MLX, in this process and in a training loop of its own (see above).
+    Resumes from the last adapter it saved at the example it had reached, then merges the adapter into the base
+    model's own files."""
     global mx
     import gc
     import mlx.core
     mx = mlx.core
 
-    data_dir = os.path.join(a.out, "mlx_data")
-    os.makedirs(data_dir, exist_ok=True)
-    rows = [json.loads(l) for l in open(a.data, encoding="utf-8") if l.strip()]
-    cut = max(1, int(len(rows) * 0.05))
-    with open(os.path.join(data_dir, "train.jsonl"), "w", encoding="utf-8") as f:
-        for r in rows[cut:]:
-            f.write(json.dumps({"text": r["text"]}) + "\n")
-    with open(os.path.join(data_dir, "valid.jsonl"), "w", encoding="utf-8") as f:
-        for r in rows[:cut]:
-            f.write(json.dumps({"text": r["text"]}) + "\n")
-    n_train = len(rows) - cut
-    emit("data", examples=len(rows), train=n_train, valid=cut)
+    texts = [json.loads(l)["text"] for l in open(a.data, encoding="utf-8") if l.strip()]
+    cut = max(1, int(len(texts) * 0.05))
+    valid, train = texts[:cut], texts[cut:]
+    emit("data", examples=len(texts), train=len(train), valid=len(valid))
 
     adapter = os.path.join(a.out, "adapter")
     os.makedirs(adapter, exist_ok=True)
     lora_params = {"rank": a.rank, "scale": a.alpha / a.rank, "dropout": a.dropout}
     # What a saved adapter must match to be continued. Sequence length and batch size may change between
     # attempts - finetune.py lowers them after running out of memory - so progress is counted in examples.
-    recipe = {"lora": lora_params, "lr": a.lr, "epochs": a.epochs, "accum": a.accum, "train": n_train,
+    recipe = {"lora": lora_params, "lr": a.lr, "epochs": a.epochs, "accum": a.accum, "train": len(train),
               "seed": a.seed}
-    goal = math.ceil(n_train * a.epochs)
+    goal = math.ceil(len(train) * a.epochs)
     prog = _read_json(os.path.join(adapter, "progress.json"))
     if prog.get("recipe") != recipe:
         prog = {}
@@ -331,11 +488,10 @@ def train_mlx(a):
     if prog.get("finished") and os.path.exists(final):
         emit("resume", checkpoint="adapters.safetensors (training already finished)")
     else:
-        _train_mlx(a, data_dir, adapter, lora_params, recipe, goal, n_train, prog)
+        _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog)
         gc.collect()
-        clear = getattr(mx, "clear_cache", None) or getattr(getattr(mx, "metal", None), "clear_cache", None)
-        if clear:
-            clear()
+        if _mem("clear_cache"):
+            _mem("clear_cache")()
 
     if a.merge:
         out = os.path.join(a.out, "merged")
@@ -347,103 +503,145 @@ def train_mlx(a):
     emit("done")
 
 
-def _train_mlx(a, data_dir, adapter, lora_params, recipe, goal, n_train, prog):
-    import inspect, types
+def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
     import numpy as np
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+    from mlx.utils import tree_flatten, tree_map
     import mlx_lm
-    from mlx_lm import lora
-    from mlx_lm.tuner import trainer
-    from mlx_lm.tuner.datasets import load_dataset
+    from mlx_lm.tuner.utils import linear_to_lora_layers
 
-    keep = os.path.join(adapter, "resume.safetensors")
-    for f in os.listdir(adapter):           # a numbered save the last run died before recording
-        if re.match(r"\d+_adapters\.safetensors$", f):
-            os.remove(os.path.join(adapter, f))
-    seen = int(prog.get("seen") or 0) if os.path.exists(keep) else 0
-    per_update = a.batch * max(1, a.accum)
-    steps_done = math.ceil(seen / a.batch)
-    remaining = max(1, math.ceil((goal - seen) / a.batch))
-    total = steps_done + remaining
-
-    installed, how = install_chunked_recurrence()
-    if not installed:
-        emit("warn", msg="linear-attention layers train through mlx-lm's per-token loop, which is slow and "
-                         "needs several GB per layer - " + how)
+    budget, seen_mem = _memory_budget()             # before anything is allocated
+    how = install_recurrence()
     if a.load_4bit:
         emit("warn", msg="4-bit base weights are not implemented for MLX; training in the base precision")
-    emit("setup", device="mlx", steps=total, gpu="Apple silicon (unified memory)", recurrence=how)
 
-    over = {"model": a.base, "train": True, "test": False, "data": data_dir, "fine_tune_type": "lora",
-            "adapter_path": adapter, "batch_size": a.batch, "iters": remaining, "learning_rate": a.lr,
-            "num_layers": -1, "lora_parameters": lora_params, "grad_accumulation_steps": a.accum,
-            "optimizer": "adamw", "optimizer_config": {"adamw": {"weight_decay": 0.01}},
-            "max_seq_length": a.seq_len, "grad_checkpoint": True, "steps_per_report": 1,
-            "steps_per_eval": max(25, a.save_steps, remaining // 50), "save_every": a.save_steps,
-            "seed": a.seed + seen, "resume_adapter_file": keep if seen else None}
-    defaults = dict(getattr(lora, "CONFIG_DEFAULTS", {}))
-    unread = [k for k in ("lora_parameters", "grad_accumulation_steps", "optimizer") if k not in defaults]
-    if unread:
-        emit("warn", msg="this mlx-lm ignores " + ", ".join(unread) + "; update it (.venv/bin/pip install -U "
-                         "mlx-lm) to train the configured recipe")
-    schedule = _lr_schedule(a.lr, math.ceil(goal / per_update), seen // per_update)
-    if hasattr(lora, "build_schedule"):     # train_model builds the schedule through this name
-        lora.build_schedule = lambda _config: schedule
-        over["lr_schedule"] = {"name": "cosine", "warmup": 0, "arguments": [a.lr]}
-    else:
-        emit("warn", msg="this mlx-lm takes no learning-rate schedule; training at a constant " + str(a.lr))
-    args = types.SimpleNamespace(**{**defaults, **over})
-
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
-    np.random.seed(args.seed)
     model, tokenizer = mlx_lm.load(a.base)
-    train_set, valid_set, _ = load_dataset(args, tokenizer)
-    gdn = any(hasattr(layer, "linear_attn") for layer in getattr(model, "layers", []))
+    model.freeze()
+    linear_to_lora_layers(model, len(model.layers), lora_params)
+    _checkpoint_layers(model)
+    keep = os.path.join(adapter, "resume.safetensors")
+    seen = int(prog.get("seen") or 0) if os.path.exists(keep) else 0
+    if seen:
+        model.load_weights(keep, strict=False)
+    model.train()
+    trainable = tree_flatten(model.trainable_parameters())
+    emit("model", trainable=sum(v.size for _, v in trainable),
+         total=sum(v.size for _, v in tree_flatten(model.parameters())),
+         targets=sorted({k.split(".")[-2] for k, _ in trainable}))
 
-    class Report(getattr(trainer, "TrainingCallback", object)):
-        tokens = 0.0
+    enc = [_encode(tokenizer, t) for t in train]
+    venc = [ids for ids in (_encode(tokenizer, t) for t in valid[:25]) if len(ids) > 1]
+    want = max(64, a.seq_len)
+    stream = []                                     # real tokens to measure steps with
+    for ids in enc:
+        stream += ids
+        if len(stream) > want:
+            break
+    loss_fn, loss_how = _make_loss(model, mx.array([stream[:16]], dtype=mx.int32))
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-        def on_train_loss_report(self, info):
-            it = int(info.get("iteration") or 0)
-            if it == 1 and installed and gdn and not CHUNK_CALLS[0]:
-                emit("warn", msg="the chunked recurrence is installed but training never called it: this "
-                                 "mlx-lm reaches the recurrence another way, so memory stays high")
-            done = _num(info.get("trained_tokens")) or 0.0
-            emit("step", step=steps_done + it, max_steps=total, loss=_num(info.get("train_loss")),
-                 lr=_num(info.get("learning_rate")), tokens=int(done - self.tokens),
-                 peak_gb=_num(info.get("peak_memory")), epoch=round((seen + it * a.batch) / n_train, 3))
-            self.tokens = done
-            self.collect()
+    def measure(n):
+        tokens = mx.array([(stream * (n // max(1, len(stream)) + 2))[:n + 1]], dtype=mx.int32)
+        clear = _mem("clear_cache")
+        if clear:
+            clear()
+        _memory_now()
+        try:
+            mx.eval(loss_and_grad(model, tokens))
+        except RuntimeError as e:
+            if not re.search(r"memory|malloc", str(e), re.I):
+                raise
+            return float("inf")
+        finally:
+            if clear:
+                clear()
+        return (_memory_now()[2] or 0) * 2 ** 30
 
-        def on_val_loss_report(self, info):
-            emit("val", step=steps_done + int(info.get("iteration") or 0), loss=_num(info.get("val_loss")),
-                 secs=_num(info.get("val_time")))
-
-        def collect(self):
-            """mlx-lm saves adapters.safetensors and a numbered copy every `save_every` steps. Keep the newest as
-            resume.safetensors, with how many examples it has seen, and delete the numbered copies: at rank
-            32 each is ~90 MB and a run writes hundreds."""
-            saved = sorted((int(m.group(1)), m.group(0)) for m in
-                           (re.match(r"(\d+)_adapters\.safetensors$", f) for f in os.listdir(adapter)) if m)
-            if not saved:
-                return
-            shutil.copyfile(os.path.join(adapter, saved[-1][1]), keep + ".tmp")
-            os.replace(keep + ".tmp", keep)
-            _write_json(os.path.join(adapter, "progress.json"),
-                        {"recipe": recipe, "seen": seen + saved[-1][0] * a.batch, "goal": goal})
-            for _, name in saved:
-                os.remove(os.path.join(adapter, name))
-            emit("checkpoint", step=steps_done + saved[-1][0])
-
+    if budget:
+        max_len, peaks = _fit_length(measure, want, budget)
+    else:
+        max_len, peaks = want, {}
+    gb = lambda b: None if b is None or b == float("inf") else round(b / 2 ** 30, 1)
+    emit("memory", ram_gb=gb(seen_mem["ram"]), working_set_gb=gb(seen_mem["working"]),
+         free_gb=gb(seen_mem["free"]), budget_gb=gb(budget), measured={str(n): gb(p) for n, p in sorted(peaks.items())},
+         max_len=max_len)
+    if not max_len:
+        raise SystemExit("out of memory: a training step needs " + str(gb(peaks[min(peaks)])) + " GB even at " +
+                         str(min(peaks)) + " tokens and " + str(gb(budget)) + " GB is free for it - close other "
+                         "apps and re-run")
+    if max_len < want:
+        emit("warn", msg="only " + str(max_len) + " of the configured " + str(want) + " tokens fit in the free "
+                         "memory, so each example is cut there")
+    cut = sum(len(ids) - 1 > max_len for ids in enc)
+    if cut:
+        emit("warn", msg=str(cut) + " of " + str(len(enc)) + " training examples are longer than " + str(max_len) +
+                         " tokens; the rest of each is not trained on")
+    per_update = max(1, a.batch) * max(1, a.accum)
+    opt = optim.AdamW(learning_rate=_lr_schedule(a.lr, math.ceil(goal / per_update), seen // per_update),
+                      weight_decay=0.01)
+    emit("setup", device="mlx", steps=goal, gpu="Apple silicon (unified memory)", recurrence=how,
+         loss=loss_how, max_len=max_len)
     if seen:
         emit("resume", checkpoint="resume.safetensors, " + str(seen) + " of " + str(goal) + " examples done")
-    extra = [tokenizer] if "tokenizer" in inspect.signature(lora.train_model).parameters else []
-    lora.train_model(args, model, *extra, train_set, valid_set, Report())
-    for f in os.listdir(adapter):
-        if re.match(r"\d+_adapters\.safetensors$", f):
-            os.remove(os.path.join(adapter, f))
+
+    def save(path):
+        tmp = path[:-len(".safetensors")] + ".partial.safetensors"    # MLX insists on the extension
+        mx.save_safetensors(tmp, dict(tree_flatten(model.trainable_parameters())))
+        os.replace(tmp, path)
+
+    def validate(step):
+        model.eval()
+        total = count = 0
+        for ids in venc:
+            ids = ids[:max_len + 1]
+            total += loss_fn(model, mx.array([ids], dtype=mx.int32)).item() * (len(ids) - 1)
+            count += len(ids) - 1
+        model.train()
+        emit("val", step=step, loss=round(total / max(1, count), 4))
+
+    every = max(25, a.save_steps, goal // 50)
+    if not seen:
+        validate(0)
+    acc, acc_n, perm = None, 0, None
+    for i in range(seen, goal):
+        epoch, pos = divmod(i, len(enc))
+        if perm is None or pos == 0:
+            perm = np.random.default_rng(a.seed + epoch).permutation(len(enc))
+        ids = enc[perm[pos]][:max_len + 1]
+        loss, grads = loss_and_grad(model, mx.array([ids], dtype=mx.int32))
+        if i == seen and not CHUNK_CALLS[0] and any(hasattr(layer, "linear_attn") for layer in model.layers):
+            emit("warn", msg="the linear-attention recurrence was replaced but training never called it: this "
+                             "mlx-lm reaches it another way, so its memory use is mlx-lm's")
+        acc = grads if acc is None else tree_map(lambda x, y: x + y, acc, grads)
+        acc_n += 1
+        norm = None
+        if acc_n == per_update or i + 1 == goal:
+            grads, norm = optim.clip_grad_norm(tree_map(lambda x: x / acc_n, acc), 1.0)
+            opt.update(model, grads)
+            acc, acc_n = None, 0
+        mx.eval([loss, model.trainable_parameters(), opt.state] + ([acc] if acc is not None else []))
+        active, cached, peak = _memory_now()
+        emit("step", step=i + 1, max_steps=goal, loss=round(loss.item(), 4), lr=_num(opt.learning_rate),
+             tokens=len(ids) - 1, peak_gb=peak, active_gb=active, cache_gb=cached,
+             grad_norm=None if norm is None else round(_num(norm), 4), epoch=round((i + 1) / len(enc), 3))
+        if (i + 1) % max(1, a.save_steps) == 0 and i + 1 < goal:
+            save(keep)
+            _write_json(os.path.join(adapter, "progress.json"),
+                        {"recipe": recipe, "seen": i + 1, "goal": goal, "max_len": max_len})
+            emit("checkpoint", step=i + 1)
+        if (i + 1) % every == 0 or i + 1 == goal:
+            validate(i + 1)
+
+    save(os.path.join(adapter, "adapters.safetensors"))
+    _write_json(os.path.join(adapter, "adapter_config.json"),
+                {"fine_tune_type": "lora", "num_layers": len(model.layers), "lora_parameters": lora_params,
+                 "model": a.base})
     _write_json(os.path.join(adapter, "progress.json"),
-                {"recipe": recipe, "seen": goal, "goal": goal, "finished": True})
-    emit("trained", adapter=adapter, chunked_calls=CHUNK_CALLS[0])
+                {"recipe": recipe, "seen": goal, "goal": goal, "max_len": max_len, "finished": True})
+    if os.path.exists(keep):
+        os.remove(keep)
+    emit("trained", adapter=adapter, replaced_recurrence_calls=CHUNK_CALLS[0])
 
 
 # ---------------------------------------------------------------- the adapter, merged into the base's own files

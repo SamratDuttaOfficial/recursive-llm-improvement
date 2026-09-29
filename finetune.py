@@ -397,7 +397,16 @@ def handle_progress(ev, prog, save, t0):
     elif kind == "setup":
         LIVE_TRAIN["state"].update(device=ev.get("device"), gpu=ev.get("gpu"))
         log("train", "device " + str(ev.get("device")) + " - " + str(ev.get("gpu", "")) +
-            ("; linear attention " + ev["recurrence"] if ev.get("recurrence") else ""))
+            ("; sequences up to " + str(ev["max_len"]) + " tokens" if ev.get("max_len") else ""))
+        if ev.get("recurrence"):
+            log("train", "linear attention: " + ev["recurrence"])
+        if ev.get("loss"):
+            log("train", "loss: " + ev["loss"])
+    elif kind == "memory":
+        steps = ", ".join(str(gb) + " GB at " + n + " tokens" for n, gb in (ev.get("measured") or {}).items())
+        log("train", "memory: " + str(ev.get("free_gb")) + " GB free of " + str(ev.get("ram_gb")) + " GB, budget " +
+            str(ev.get("budget_gb")) + " GB" + ("; a training step takes " + steps if steps else "") +
+            " -> training at " + str(ev.get("max_len")) + " tokens")
     elif kind == "model":
         LIVE_TRAIN["state"].update(trainable=ev.get("trainable"), total=ev.get("total"))
         log("train", "LoRA on " + ", ".join(ev.get("targets", [])) + ": " +

@@ -199,12 +199,15 @@ LoRA (rank 32, alpha 64, 3 epochs, cosine schedule) over the corpus in ChatML fo
 into the base weights and converted to GGUF so the next round can be served by the same `llama-server`.
 
 - **NVIDIA / CPU**: PyTorch + PEFT, bf16, gradient checkpointing, resumed from the last `checkpoint-N`.
-- **Apple silicon**: `mlx-lm` LoRA on the unified-memory GPU, resumed from the last saved adapter at the
-  example it had reached. mlx-lm trains Qwen3.5's linear-attention layers one token at a time, which needs
-  several GB per layer and ran a 2048-token example out of memory, so `train_worker.py` swaps in a chunked
-  version of the same recurrence - after checking it against mlx-lm's own on the machine, and keeping mlx-lm's
-  if they disagree. The adapter is merged into the original Hugging Face files rather than with `mlx_lm fuse`,
-  whose output is in MLX's layout and cannot be converted to GGUF.
+- **Apple silicon**: MLX LoRA on the unified-memory GPU, in a training loop of `train_worker.py`'s own so that
+  everything deciding a step's memory is sized there. Qwen3.5's linear-attention layers train through a chunked
+  form of their recurrence (mlx-lm's goes one token at a time and needs several GB per layer), checked against
+  mlx-lm's on the machine, with mlx-lm's own under checkpointing as the fallback; the loss takes the 248k-token
+  vocabulary in slices; every layer is checkpointed. MLX is held to the memory that is actually free - by
+  default it sizes itself by the GPU working set, about 3/4 of RAM - and a few real steps are measured first, so
+  training runs at the longest sequence that fits and the log says what it measured. It resumes at the exact
+  example it had reached. The adapter is merged into the original Hugging Face files rather than with
+  `mlx_lm fuse`, whose output is in MLX's layout and cannot be converted to GGUF.
 
 The right stack is installed automatically for whichever machine you are on. Out of memory is not a failure:
 the sequence length halves, then (PyTorch only) the base drops to 4-bit, and training restarts from the last
