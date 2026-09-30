@@ -12,13 +12,17 @@ Seven phases, each recorded the moment it finishes:
     dataset -> deps -> base weights -> train -> merge -> gguf -> register
 Re-running skips everything already done; an interrupted training resumes from its last checkpoint.
 
-The recipe - epochs, LoRA rank, learning rate, sequence length, what a corpus answer has to score to be
-trained on - lives in the `finetune` block of `config.json`, and a flag overrides it for one run.
+The recipe - epochs, LoRA rank, learning rate, sequence length, whether only the correct answers are trained
+on - lives in the `finetune` block of `config.json`, and a flag overrides it for one run.
+
+`python finetune.py --remove v1` deletes a version, so the next run trains it again from scratch.
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time
+import argparse, ast, concurrent.futures as cf, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time
 
 from common import (DATA, Dash, Interrupted, LOGS, Log, MODELS, Registry, STATE, Stop, Venv, WIN, ARM_MAC,
-                    common_state, download, fmt_t, gpu_status, log, phase, read_json, read_jsonl, write_json)
+                    chatml_prompt, common_state, download, fmt_t, gpu_status, log, phase, read_json, read_jsonl,
+                    write_json)
+import codecheck
 import config as conf
 import prompts
 
@@ -37,6 +41,7 @@ OOM = re.compile(r"out of memory|outofmemory|insufficient memory|metal::malloc",
 # from the last checkpoint.
 GPU_FAULT = re.compile(r"command buffer execution failed|kIOGPUCommandBufferCallbackError|GPU error/recovery", re.I)
 RETRIES = 3         # failed attempts in a row with no new checkpoint between them, and training gives up
+DATA_FORMAT = "chatml, empty reasoning block, loss on the answer"      # how a corpus row becomes training text
 
 # Which config key backs each flag. A flag the user actually passes wins; anything else comes from the file.
 CONFIG_MAP = {
@@ -44,16 +49,89 @@ CONFIG_MAP = {
     "epochs": "finetune.epochs", "batch": "finetune.batch", "accum": "finetune.accum",
     "seq_len": "finetune.seq_len", "lr": "finetune.lr", "rank": "finetune.rank",
     "alpha": "finetune.alpha", "save_steps": "finetune.save_steps",
-    "min_examples": "finetune.min_examples",
+    "min_examples": "finetune.min_examples", "only_correct": "finetune.only_correct",
+    "exec_timeout": "corpus.exec_timeout",
     "dash_port": "ui.ports.finetune",
 }
 
 
 # ---------------------------------------------------------------- the training set
 def chatml(question, answer):
-    return ("<|im_start|>system\n" + prompts.SFT_SYSTEM + "<|im_end|>\n"
-            "<|im_start|>user\n" + question.strip() + "<|im_end|>\n"
-            "<|im_start|>assistant\n" + answer.strip() + "<|im_end|>")
+    """One training example: the prompt exactly as a model is later asked with it (common.chatml_prompt), the
+    answer after it, and how many characters of it are prompt. The loss is taken on the answer only."""
+    prompt = chatml_prompt(prompts.SFT_SYSTEM, question.strip())
+    return prompt + answer.strip() + "<|im_end|>", len(prompt)
+
+
+def asserts_at_top(code):
+    """True when the code has assert statements of its own at module level, which ran when the checker ran it."""
+    try:
+        return any(isinstance(node, ast.Assert) for node in ast.parse(code).body)
+    except SyntaxError:
+        return False
+
+
+def correctness(answer, timeout):
+    """None when an answer is correct as far as it can be checked here, otherwise why it is not. Correct means:
+    the code is complete, the checker finds no errors in it, it runs, and every check it carries holds - its own
+    assert examples, doctests and test_ functions - of which it has at least one, since an answer with nothing to
+    check it against is not known to be correct. The checker is the one run.py scores answers with."""
+    rep, code = codecheck.check(answer, run=True, timeout=timeout)
+    ex = rep.get("exec") or {}
+    doc, tests, own = ex.get("doctest") or {}, ex.get("tests") or [], ex.get("examples")
+    if not code:
+        return "no code"
+    if rep.get("truncated"):
+        return "cut off"
+    if (rep.get("counts") or {}).get("error"):
+        return "checker errors"
+    if ex.get("timeout"):
+        return "times out"
+    if not ex.get("import_ok"):
+        return "crashes"
+    if (own and not own.get("ok")) or doc.get("failed") or doc.get("error") or any(not t.get("ok") for t in tests):
+        return "fails its own asserts"
+    if not ((own and own.get("ok")) or doc.get("attempted") or tests or asserts_at_top(code)):
+        return "has no asserts to check"
+    return None
+
+
+def answer_key(it):
+    return hashlib.sha1(str(it.get("answer") or "").encode("utf-8", "replace")).hexdigest()
+
+
+def verify(items, a, out_dir):
+    """correctness() for every answer, several at a time. The verdicts are kept in out_dir/verdicts.json as they
+    come in, so a stopped run does not check the same answers twice. Returns {answer_key: reason or None}."""
+    path = os.path.join(out_dir, "verdicts.json")
+    cache = read_json(path, {}) or {}
+    todo = list({answer_key(it): it for it in items if answer_key(it) not in cache}.items())
+    if todo:
+        phase("dataset", "checking which answers are correct")
+        log("dataset", "checking " + str(len(todo)) + " answers: does each one run and pass its own asserts?")
+        codecheck.ruff_available()          # installed once here, not by every worker at the same moment
+        done, t0 = 0, time.time()
+        pool = cf.ThreadPoolExecutor(max_workers=max(2, min(16, os.cpu_count() or 4)))
+        futs = {pool.submit(correctness, it["answer"], a.exec_timeout): key for key, it in todo}
+        try:
+            for f in cf.as_completed(futs):
+                if Stop.is_set():
+                    raise Interrupted()
+                try:
+                    cache[futs[f]] = f.result() or ""
+                except Exception as e:
+                    cache[futs[f]] = "check failed (" + type(e).__name__ + ")"
+                done += 1
+                if done % 100 == 0:
+                    write_json(path, cache)
+                    log("dataset", "  " + str(done) + "/" + str(len(todo)) + " checked, eta " +
+                        fmt_t((time.time() - t0) / done * (len(todo) - done)))
+        finally:
+            for f in futs:
+                f.cancel()
+            pool.shutdown(wait=not Stop.is_set())
+            write_json(path, cache)
+    return {k: (v or None) for k, v in cache.items()}
 
 
 def corpus_rounds(run):
@@ -110,11 +188,12 @@ def corpus_files(a):
 
 
 def build_dataset(a, out_dir):
-    """Every corpus answer from the requested rounds, newest rounds last, de-duplicated by exercise.
+    """The corpus answers from the requested rounds, newest rounds last, de-duplicated by exercise.
 
-    Nothing is held back. run.py saves an answer for each exercise and all of them are trained on; what
-    the model did badly is part of what it did. The checker score rides along on each row so the report
-    can show the spread.
+    With `finetune.only_correct` (the default) only the correct answers are trained on - those that run, pass
+    their own asserts and have no checker errors (see correctness()). run.py still saves an answer for every
+    exercise; this is where the wrong ones are left out, and the log says how many and why. With it off, every
+    answer is trained on. The checker score rides along on each row so the report can show the spread.
 
     A row is read for what it has. `host`, `run`, `kept` and `clean` were added to the format later and a
     corpus written before that has none of them - it still trains, it just reports its machine as unknown.
@@ -143,36 +222,56 @@ def build_dataset(a, out_dir):
     # Newest rounds last, so that when the same exercise appears twice the later answer is the one kept.
     # Between two machines' round 1 the order is by host name, which is arbitrary but at least stable.
     everything.sort(key=lambda it: (rnd(it), str(it.get("host") or ""), str(it.get("qid") or "")))
+    dropped = {}
+    if a.only_correct:          # before de-duplicating, so a wrong later answer cannot push out a correct one
+        verdicts = verify(everything, a, out_dir)
+        right = [it for it in everything if not verdicts.get(answer_key(it))]
+        for it in everything:
+            why = verdicts.get(answer_key(it))
+            if why:
+                dropped[why] = dropped.get(why, 0) + 1
+        log("dataset", str(len(right)) + " of " + str(len(everything)) + " answers are correct (they run, pass "
+            "their own asserts and have no checker errors) - training on those only" +
+            ("; left out: " + ", ".join(str(n) + " " + why for why, n in
+                                        sorted(dropped.items(), key=lambda x: -x[1])) if dropped else ""), "bold")
+        everything = right
     rows, seen, per_round, hosts = [], {}, {}, {}
     for it in everything:
         key = re.sub(r"\W+", "", (it.get("title") or it.get("qid") or it.get("question", ""))[:120].lower())
         seen[key] = it
+    if len(files) > 1:
+        log("corpus", str(len(files)) + " corpus files, " + str(len(everything)) + " answers, " +
+            str(len(seen)) + " after de-duplicating by exercise")
+        for path, n in per_file:
+            log("corpus", "    " + str(n).rjust(5) + "  " + short_path(path), "dim")
     for key, it in seen.items():
         n, host = rnd(it), str(it.get("host") or "?")
         per_round[n] = per_round.get(n, 0) + 1
         hosts[host] = hosts.get(host, 0) + 1
-        text = chatml(it["question"], it["answer"])
-        rows.append({"text": text, "qid": it.get("qid") or key[:24], "round": n, "host": it.get("host"),
-                     "score": it.get("check_score"), "chars": len(text)})
+        text, prompt_chars = chatml(it["question"], it["answer"])
+        rows.append({"text": text, "prompt_chars": prompt_chars, "qid": it.get("qid") or key[:24], "round": n,
+                     "host": it.get("host"), "score": it.get("check_score"), "chars": len(text)})
     rows.sort(key=lambda r: (r["round"], str(r["host"] or ""), r["qid"]))
-    if len(files) > 1:
-        log("corpus", str(len(files)) + " corpus files, " + str(len(everything)) + " answers, " +
-            str(len(rows)) + " after de-duplicating by exercise")
-        for path, n in per_file:
-            log("corpus", "    " + str(n).rjust(5) + "  " + short_path(path), "dim")
     if len(rows) < a.min_examples:
-        sys.exit("only " + str(len(rows)) + " answers in the corpus (need at least " + str(a.min_examples) +
-                 "). Generate more with:  python run.py --new")
+        sys.exit("only " + str(len(rows)) + (" correct" if a.only_correct else "") + " answers in the corpus "
+                 "(need at least " + str(a.min_examples) + ")" +
+                 (" - " + str(sum(dropped.values())) + " more were left out as not correct, and "
+                  "`--all-answers` trains on them too" if dropped else "") +
+                 ". Generate more with:  python run.py --new")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "dataset.jsonl")
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    fingerprint = hashlib.sha1(
-        "|".join(r["qid"] + ":" + str(r["score"]) for r in rows).encode()).hexdigest()[:16]
+    # What the data is, for the duplicate check: which answers, and how they were turned into training text - a
+    # version trained before the text had the reasoning block, or before the wrong answers were left out, is not a
+    # copy of one trained now on the same rounds.
+    fingerprint = hashlib.sha1((DATA_FORMAT + ("|correct only|" if a.only_correct else "|") + "|".join(
+        r["qid"] + ":" + str(r["score"]) for r in rows)).encode()).hexdigest()[:16]
     stats = {"examples": len(rows), "rounds": per_round, "hosts": hosts, "sources": len(files),
              "chars": sum(r["chars"] for r in rows),
-             "avg_chars": round(sum(r["chars"] for r in rows) / len(rows)), "fingerprint": fingerprint}
+             "avg_chars": round(sum(r["chars"] for r in rows) / len(rows)), "fingerprint": fingerprint,
+             "only_correct": bool(a.only_correct), "left_out": dropped}
     named = [h for h in hosts if h != "?"]      # a corpus written before `host` existed reports as "?"
     note = ([("across " + str(len(named)) + " machines")] if len(named) > 1 else []) + \
            ([(str(hosts["?"]) + " with no machine stamp")] if hosts.get("?") and named else [])
@@ -422,6 +521,13 @@ def handle_progress(ev, prog, save, clock):
     elif kind == "val":
         if ev.get("loss") is not None:
             log("train", "validation loss " + format(ev["loss"], ".4f") + " at step " + str(ev.get("step")))
+    elif kind == "trained":
+        if ev.get("kept_step") is not None:
+            prog["kept"] = {"step": ev["kept_step"], "val_loss": ev.get("val_loss")}
+            save()
+            log("train", "keeping the adapter from step " + str(ev["kept_step"]) + ", where the validation loss was "
+                "lowest" + (" (" + format(ev["val_loss"], ".4f") + ")" if ev.get("val_loss") is not None else ""),
+                "green")
     elif kind == "warn":
         log("warn", str(ev.get("msg"))[:300], "yellow")
     elif kind == "checkpoint":
@@ -550,6 +656,100 @@ def unconverted(a):
     return last["id"] if os.path.exists(os.path.join(str(last.get("merged")), "config.json")) else None
 
 
+def _inside(path, root):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except ValueError:                      # a different drive on Windows
+        return False
+
+
+def _du(path):
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(path) for f in fs
+               if os.path.isfile(os.path.join(d, f)))
+
+
+def remove_version(vid):
+    """Delete a fine-tuned version for good, so the next fine-tune makes it again under the same name from
+    scratch: its registry entry, its training folder (dataset, adapter, merged weights), its GGUF, and its
+    benchmark results in every run - the benchmark keeps answers by model name, so a new model of the same name
+    would otherwise inherit the old one's. The rounds it wrote as the generator are moved to
+    state/<run>/removed/<version>-<time>/ rather than deleted, and a pipeline cycle still answering with it is
+    closed, so the pipeline starts a new one."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    rel = lambda p: os.path.relpath(p, here) if _inside(p, here) else p
+    reg = Registry.load()
+    entry = next((v for v in reg.get("versions", []) if v.get("id") == vid), None)
+    if not entry:
+        sys.exit("there is no version '" + vid + "' to remove (registered: " +
+                 (", ".join(v["id"] for v in reg.get("versions", [])) or "none") + ")")
+    kids = [v["id"] for v in reg["versions"] if v.get("parent") == vid]
+    if kids:
+        sys.exit(vid + " cannot be removed on its own: " + ", ".join(kids) + " " +
+                 ("were" if len(kids) > 1 else "was") + " trained on top of it. Remove " +
+                 ("those" if len(kids) > 1 else "it") + " first.")
+    runs = sorted(d for d in os.listdir(STATE) if os.path.isdir(os.path.join(STATE, d))) if os.path.isdir(STATE) else []
+    ft = os.path.dirname(str(entry.get("merged") or ""))
+    if not (os.path.basename(ft) == vid and _inside(ft, STATE)):
+        ft = os.path.join(STATE, str(entry.get("run") or "default"), "ft", vid)
+    gg = os.path.dirname(str(entry.get("gguf") or ""))
+    if not (os.path.basename(gg) == vid and _inside(gg, MODELS)):
+        gg = os.path.join(MODELS, vid)
+    freed = 0
+    for d in [ft, gg] + [os.path.join(STATE, r, "bench", vid) for r in runs]:
+        if os.path.isdir(d):
+            size = _du(d)
+            shutil.rmtree(d)
+            freed += size
+            log("remove", "deleted " + rel(d) + " (" + format(size / 1e9, ".2f") + " GB)")
+    stamp_ = time.strftime("%Y%m%d-%H%M%S")
+    for r in runs:
+        rounds_dir, corpus_dir = os.path.join(STATE, r, "rounds"), os.path.join(STATE, r, "corpus")
+        mine = sorted(n for n in (os.listdir(rounds_dir) if os.path.isdir(rounds_dir) else [])
+                      if re.match(r"round_\d+$", n) and
+                      (read_json(os.path.join(rounds_dir, n, "info.json"), {}) or {}).get("generator") == vid)
+        if not mine:
+            continue
+        away = os.path.join(STATE, r, "removed", vid + "-" + stamp_)
+        os.makedirs(os.path.join(away, "rounds"), exist_ok=True)
+        os.makedirs(os.path.join(away, "corpus"), exist_ok=True)
+        for n in mine:
+            os.replace(os.path.join(rounds_dir, n), os.path.join(away, "rounds", n))
+            if os.path.exists(os.path.join(corpus_dir, n + ".jsonl")):
+                os.replace(os.path.join(corpus_dir, n + ".jsonl"), os.path.join(away, "corpus", n + ".jsonl"))
+        nums = {int(n.split("_")[1]) for n in mine}
+        meta_path = os.path.join(STATE, r, "meta.json")
+        meta = read_json(meta_path, None)
+        if isinstance(meta, dict) and meta.get("rounds"):
+            meta["rounds"] = [x for x in meta["rounds"] if not (x.get("n") in nums and x.get("generator") == vid)]
+            write_json(meta_path, meta)
+        log("remove", "moved the " + str(len(mine)) + " round(s) " + vid + " wrote in run '" + r + "' (" +
+            ", ".join(str(x) for x in sorted(nums)) + ") to " + rel(away) + " - delete that folder if you do "
+            "not want them back")
+    for r in runs:
+        pj = os.path.join(STATE, r, "pipeline.json")
+        st = read_json(pj, None)
+        last = (st or {}).get("cycles", [None])[-1] if isinstance(st, dict) and st.get("cycles") else None
+        if not (st and st.get("job") and last and not last.get("finished")):
+            continue
+        if last.get("generator") == vid:
+            last["abandoned"] = vid + " was removed"
+            st.pop("job", None)
+            write_json(pj, st)
+            log("remove", "closed pipeline cycle " + str(last.get("n")) + " of run '" + r + "', which was answering "
+                "with " + vid + ": the next pipeline run starts a new cycle")
+        elif last.get("produced") == vid:        # stopped after training it: the same command trains it again
+            last["done"] = [s for s in last.get("done", []) if s == "corpus"]
+            last.pop("produced", None)
+            last.pop("versions_before", None)
+            write_json(pj, st)
+            log("remove", "pipeline cycle " + str(last.get("n")) + " of run '" + r + "' had trained " + vid +
+                ": running the pipeline again trains it anew")
+    reg["versions"] = [v for v in reg["versions"] if v.get("id") != vid]
+    Registry.save(reg)
+    log("done", vid + " is removed (" + format(freed / 1e9, ".1f") + " GB freed). The next `python finetune.py` "
+        "trains " + "v" + str(Registry.next_n()) + " from scratch.", "green")
+
+
 def main():
     O = conf.opt()      # a flag with no default: when it is not passed, config.json decides
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -575,6 +775,15 @@ def main():
     ap.add_argument("--alpha", type=int, default=O)
     ap.add_argument("--save-steps", type=int, default=O)
     ap.add_argument("--min-examples", type=int, default=O)
+    ap.add_argument("--only-correct", dest="only_correct", action="store_true", default=O,
+                    help="train only on answers that run, pass their own asserts and have no checker errors "
+                         "(the default: finetune.only_correct in config.json)")
+    ap.add_argument("--all-answers", dest="only_correct", action="store_false", default=O,
+                    help="train on every answer in the corpus, correct or not")
+    ap.add_argument("--remove", default="", metavar="VERSION",
+                    help="delete a fine-tuned version - its registry entry, training files, GGUF and benchmark "
+                         "results - so the next run trains it again from scratch; the rounds it wrote are "
+                         "moved to state/<run>/removed/")
     ap.add_argument("--load-4bit", action="store_true", help="load the base in 4-bit (tight GPUs)")
     ap.add_argument("--force-torch", action="store_true", help="use PyTorch even on Apple silicon")
     ap.add_argument("--no-gguf", action="store_true", help="stop after merging, do not convert")
@@ -593,6 +802,10 @@ def main():
     cfg = conf.load(a.config or None)
     conf.apply(a, cfg, CONFIG_MAP)
     a.config = cfg.path
+    if a.remove:
+        remove_version(a.remove.strip())
+        return
+    a.exec_timeout = int(a.exec_timeout or 25)
     a.hf_candidates = list(cfg.get("model.hf_candidates") or [])
     a.load_4bit = a.load_4bit or bool(cfg.get("finetune.load_4bit"))
     a.force_torch = a.force_torch or bool(cfg.get("finetune.force_torch"))
@@ -631,7 +844,8 @@ def main():
                "  config     " + os.path.basename(a.config),
                "  from       " + (parent["id"] + " (stacking: its weights are trained further)" if parent
                                   else "the base model (a clean run, not compounded on an earlier version)"),
-               "  corpus     state/" + a.run + "/corpus" + (" rounds " + a.rounds if a.rounds else " (all rounds)"),
+               "  corpus     state/" + a.run + "/corpus" + (" rounds " + a.rounds if a.rounds else " (all rounds)") +
+               (", correct answers only" if a.only_correct else ", every answer"),
                "  recipe     LoRA r=" + str(a.rank) + " alpha=" + str(a.alpha) + ", " + str(a.epochs) +
                " epochs, lr " + str(a.lr) + ", seq " + str(a.seq_len) +
                ", effective batch " + str(a.batch * a.accum),
@@ -647,7 +861,16 @@ def main():
         # ---- 1. dataset
         phase("dataset", "collecting the corpus answers")
         data = os.path.join(out_dir, "dataset.jsonl")
-        if not prog.get("dataset") or not os.path.exists(data):
+        # A training set built with the other setting, or before there was one, is built again while training has
+        # not finished - the worker then starts over, since its data changed. A finished training keeps its own.
+        stale = bool(prog.get("dataset")) and not prog.get("train_done") and \
+            prog["dataset"].get("only_correct") != bool(a.only_correct)
+        if stale:
+            log("dataset", "the training set was built " + ("before only the correct answers could be chosen"
+                                                            if "only_correct" not in prog["dataset"] else
+                                                            "with the other --only-correct setting") +
+                "; building it again")
+        if not prog.get("dataset") or not os.path.exists(data) or stale:
             data, stats = build_dataset(a, out_dir)
             check_duplicate(a, vid, parent, stats)
             prog["dataset"] = stats
@@ -715,8 +938,10 @@ def main():
                 "fingerprint": prog.get("dataset", {}).get("fingerprint"),
                 "trained_on": mine, "rounds": sorted(set(mine + inherited)),
                 "recipe": {"rank": a.rank, "alpha": a.alpha, "epochs": a.epochs, "lr": a.lr,
-                           "seq_len": a.seq_len, "batch": a.batch, "accum": a.accum, "backend": backend},
-                "steps": prog.get("step"), "params": {}}
+                           "seq_len": a.seq_len, "batch": a.batch, "accum": a.accum, "backend": backend,
+                           "only_correct": bool((prog.get("dataset") or {}).get("only_correct")),
+                           "data": DATA_FORMAT},
+                "kept": prog.get("kept"), "steps": prog.get("step"), "params": {}}
         Registry.add_version(info)
         prog["phase"] = "done"
         prog["finished"] = time.time()

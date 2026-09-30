@@ -307,7 +307,7 @@ def ast_lint(code):
 
 # ---------------------------------------------------------------- 4. execute (separate process, timeout)
 RUNNER = r'''
-import doctest, io, json, os, runpy, sys, traceback
+import doctest, inspect, io, json, os, runpy, sys, traceback
 target = sys.argv[1]
 out = {"import_ok": False, "import_error": None, "doctest": None, "tests": [], "stdout": "",
        "examples": None}
@@ -323,12 +323,20 @@ except BaseException:
 sys.stdout = real
 out["stdout"] = buf.getvalue()[-1500:]
 if out["import_ok"]:
+    # The doctests of the answer's own functions and classes, and of its module docstring. doctest.testmod cannot
+    # find them: run_path hands back a copy of the namespace, so no function looks like it belongs to a module.
     try:
-        import types
-        mod = types.ModuleType("answer")
-        mod.__dict__.update(g)
-        r = doctest.testmod(mod, verbose=False, report=False)
-        out["doctest"] = {"attempted": r.attempted, "failed": r.failed}
+        finder, runner = doctest.DocTestFinder(), doctest.DocTestRunner(verbose=False)
+        tests = [t for name, obj in list(g.items())
+                 if getattr(obj, "__module__", None) == "__answer__" and (inspect.isfunction(obj) or inspect.isclass(obj))
+                 for t in finder.find(obj, name, module=False, globs=dict(g))]
+        if g.get("__doc__"):
+            tests.append(doctest.DocTestParser().get_doctest(g["__doc__"], dict(g), "__answer__", target, 0))
+        attempted = failed = 0
+        for t in tests:
+            r = runner.run(t, out=lambda s: None)
+            attempted, failed = attempted + r.attempted, failed + r.failed
+        out["doctest"] = {"attempted": attempted, "failed": failed}
     except BaseException as e:
         out["doctest"] = {"error": str(e)[:200]}
     for name, fn in list(g.items()):

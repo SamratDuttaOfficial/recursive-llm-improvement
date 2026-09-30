@@ -10,7 +10,7 @@ Two backends, chosen by the machine:
 Both print one JSON PROGRESS line per logging step so the dashboard can draw the loss curve. Everything here
 is idempotent: killed at any point, the next start continues.
 """
-import argparse, json, math, os, re, shutil, subprocess, sys, time
+import argparse, hashlib, json, math, os, re, shutil, subprocess, sys, time
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -19,12 +19,43 @@ def emit(kind, **data):
     print("PROGRESS " + json.dumps({"kind": kind, "t": time.time(), **data}), flush=True)
 
 
+def _common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _file_hash(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def _rows(path):
+    """The training set, held out in the same way by both backends: the first 5% for validation."""
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    cut = max(1, int(len(rows) * 0.05))
+    return rows[cut:], rows[:cut]
+
+
+# Every example is a prompt - the system prompt and the exercise, up to the empty reasoning block - followed by the
+# answer, and `prompt_chars` in the training set says where one ends. Only the answer is trained on: the model is
+# shown the prompt but not taught to write it. A row without `prompt_chars` is trained on whole.
+VALID = 25              # validation examples, the same few every time
+
+
 # ---------------------------------------------------------------- torch / PEFT
 def train_torch(a):
+    import inspect
     import torch
     from datasets import Dataset
     from peft import LoraConfig, get_peft_model, PeftModel
-    from transformers import (AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling,
+    from transformers import (AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq,
                               Trainer, TrainerCallback, TrainingArguments)
 
     use_cuda = torch.cuda.is_available()
@@ -37,15 +68,29 @@ def train_torch(a):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    rows = [json.loads(l) for l in open(a.data, encoding="utf-8") if l.strip()]
-    emit("data", examples=len(rows))
+    train, valid = _rows(a.data)
+    emit("data", examples=len(train) + len(valid), train=len(train), valid=len(valid))
 
     def encode(batch):
+        """Token ids, with labels that repeat them over the answer and are -100 - not trained on - over the prompt."""
         out = tok(batch["text"], truncation=True, max_length=a.seq_len)
+        out["labels"] = []
+        for text, chars, ids in zip(batch["text"], batch["prompt_chars"], out["input_ids"]):
+            n = _common_prefix(tok(text[:chars])["input_ids"], ids) if chars else 0
+            out["labels"].append([-100] * n + list(ids[n:]))
         return out
 
-    ds = Dataset.from_list([{"text": r["text"]} for r in rows]).map(
-        encode, batched=True, remove_columns=["text"])
+    def dataset(rows):
+        ds = Dataset.from_list([{"text": r["text"], "prompt_chars": int(r.get("prompt_chars") or 0)} for r in rows])
+        ds = ds.map(encode, batched=True, remove_columns=["text", "prompt_chars"])
+        # an example whose answer starts past seq_len has nothing to learn from, and would make the loss NaN
+        return ds.filter(lambda ex: any(t != -100 for t in ex["labels"]))
+
+    ds, eval_ds = dataset(train), dataset(valid[:VALID])
+    if len(ds) < len(train):
+        emit("warn", msg=str(len(train) - len(ds)) + " of " + str(len(train)) + " training examples have no answer "
+                         "within the first " + str(a.seq_len) + " tokens - the exercise alone fills them - and are "
+                         "skipped")
 
     quant = None
     if a.load_4bit:
@@ -69,7 +114,15 @@ def train_torch(a):
     emit("model", trainable=trainable, total=sum(p.numel() for p in model.parameters()), targets=targets)
 
     ckpt_dir = os.path.join(a.out, "ckpt")
+    # What a checkpoint must match to be continued: different data or a different loss is a different training.
+    # Sequence length, batch size and 4-bit loading may change between attempts, when finetune.py steps down after
+    # running out of memory.
+    recipe = {"data": _file_hash(a.data), "loss": "answer", "rank": a.rank, "alpha": a.alpha, "lr": a.lr,
+              "epochs": a.epochs, "accum": a.accum, "seed": a.seed}
+    if _read_json(os.path.join(ckpt_dir, "recipe.json")) != recipe:
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
     os.makedirs(ckpt_dir, exist_ok=True)
+    _write_json(os.path.join(ckpt_dir, "recipe.json"), recipe)
     resume = None
     if os.path.isdir(ckpt_dir):
         cks = [d for d in os.listdir(ckpt_dir) if d.startswith("checkpoint-")]
@@ -81,6 +134,9 @@ def train_torch(a):
         def on_log(self, args_, state, control, logs=None, **kw):
             if not logs:
                 return
+            if "eval_loss" in logs:
+                emit("val", step=state.global_step, loss=round(logs["eval_loss"], 4))
+                return
             emit("step", step=state.global_step, max_steps=state.max_steps,
                  loss=logs.get("loss"), lr=logs.get("learning_rate"),
                  epoch=round(state.epoch or 0, 3), grad_norm=logs.get("grad_norm"))
@@ -88,21 +144,37 @@ def train_torch(a):
         def on_save(self, args_, state, control, **kw):
             emit("checkpoint", step=state.global_step)
 
+    # The adapter kept is the one with the lowest validation loss, not the last: the later epochs can overfit.
+    judged = len(eval_ds) > 0
+    known = inspect.signature(TrainingArguments.__init__).parameters
+    # transformers 5 dropped warmup_ratio - its warmup_steps takes the ratio instead - and save_safetensors, which
+    # it always does; 4.x needs both spelled out
+    version_kw = ({"warmup_ratio": 0.05} if "warmup_ratio" in known else {"warmup_steps": 0.05})
+    if "save_safetensors" in known:
+        version_kw["save_safetensors"] = True
     targs = TrainingArguments(
         output_dir=ckpt_dir, num_train_epochs=a.epochs, per_device_train_batch_size=a.batch,
         gradient_accumulation_steps=a.accum, learning_rate=a.lr, lr_scheduler_type="cosine",
-        warmup_ratio=0.05, logging_steps=1, save_steps=a.save_steps, save_total_limit=2,
+        logging_steps=1, save_steps=a.save_steps, save_total_limit=2,
+        eval_strategy="steps" if judged else "no", eval_steps=a.save_steps, per_device_eval_batch_size=1,
+        prediction_loss_only=True, load_best_model_at_end=judged, metric_for_best_model="eval_loss",
+        greater_is_better=False,
         bf16=(dtype == torch.bfloat16), fp16=(dtype == torch.float16),
         gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_torch", weight_decay=0.01, max_grad_norm=1.0, report_to=[],
-        dataloader_num_workers=0, seed=a.seed, save_safetensors=True, disable_tqdm=True)
-    trainer = Trainer(model=model, args=targs, train_dataset=ds, callbacks=[Progress()],
-                      data_collator=DataCollatorForLanguageModeling(tok, mlm=False))
+        dataloader_num_workers=0, seed=a.seed, disable_tqdm=True, **version_kw)
+    trainer = Trainer(model=model, args=targs, train_dataset=ds, eval_dataset=eval_ds if judged else None,
+                      callbacks=[Progress()],
+                      data_collator=DataCollatorForSeq2Seq(tok, padding=True, label_pad_token_id=-100))
     trainer.train(resume_from_checkpoint=resume)
+    best = trainer.state.best_model_checkpoint
+    kept = {"kept_step": int(best.rsplit("-", 1)[1]) if best else trainer.state.global_step,
+            "val_loss": round(trainer.state.best_metric, 4) if best and trainer.state.best_metric is not None
+            else None}
     adapter = os.path.join(a.out, "adapter")
     trainer.model.save_pretrained(adapter)
     tok.save_pretrained(adapter)
-    emit("trained", adapter=adapter)
+    emit("trained", adapter=adapter, **kept)
 
     if a.merge:
         emit("merging", to=os.path.join(a.out, "merged"))
@@ -375,12 +447,12 @@ def _ce_sum(logits, targets):
 
 
 def _make_loss(model, sample):
-    """The training loss - mean cross-entropy over an example's tokens - from the model's hidden states, with the
-    vocabulary taken SLICE tokens at a time under checkpointing, so the full logits never exist at once. Falls
-    back to the model's own logits when its output layer cannot be split off and shown to give the same logits
-    on `sample`. Returns (loss(model, tokens), what it does, for the log)."""
-    def whole(model, tokens):
-        return _ce_sum(model(tokens[:, :-1]), tokens[:, 1:]) / (tokens.shape[1] - 1)
+    """The training loss - mean cross-entropy over an example's answer, the targets from `first` on - from the
+    model's hidden states, with the vocabulary taken SLICE tokens at a time under checkpointing, so the full logits
+    never exist at once. Falls back to the model's own logits when its output layer cannot be split off and shown
+    to give the same logits on `sample`. Returns (loss(model, tokens, first), what it does, for the log)."""
+    def whole(model, tokens, first=0):
+        return _ce_sum(model(tokens[:, :-1])[:, first:], tokens[:, 1 + first:]) / (tokens.shape[1] - 1 - first)
 
     try:
         inner = model["language_model"] if "language_model" in model else model     # Qwen3.5 wraps its text model
@@ -397,14 +469,14 @@ def _make_loss(model, sample):
         return whole, ("the whole vocabulary at once (the split-off output layer differed by " +
                        format(diff, ".0e") + ")")
 
-    def sliced(model, tokens):
+    def sliced(model, tokens, first=0):
         targets = tokens[:, 1:]
         h = body(tokens[:, :-1])
         total = mx.array(0.0, dtype=mx.float32)
-        for s in range(0, targets.shape[1], SLICE):
+        for s in range(first, targets.shape[1], SLICE):      # the prompt's positions never reach the output layer
             part = mx.checkpoint(lambda x, t=targets[:, s:s + SLICE]: _ce_sum(head(x), t))
             total = total + part(h[:, s:s + SLICE])
-        return total / targets.shape[1]
+        return total / (targets.shape[1] - first)
     return sliced, "the vocabulary " + str(SLICE) + " tokens at a time"
 
 
@@ -433,6 +505,22 @@ def _encode(tokenizer, text):
     if eos is not None and (not ids or ids[-1] != eos):
         ids.append(eos)
     return ids
+
+
+def _example(tokenizer, row):
+    """One training row as (token ids, the first target that is answer rather than prompt). The prompt's tokens are
+    the part of the ids its own encoding matches, so a token straddling the boundary counts as answer."""
+    ids = _encode(tokenizer, row["text"])
+    chars = int(row.get("prompt_chars") or 0)
+    if not chars:
+        return ids, 0
+    return ids, max(0, _common_prefix(list(tokenizer.encode(row["text"][:chars])), ids) - 1)
+
+
+def _st_metadata(path):
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        return json.loads(f.read(n)).get("__metadata__") or {}
 
 
 def _lr_schedule(lr, updates, done):
@@ -495,10 +583,8 @@ def train_mlx(a):
     import mlx.core
     mx = mlx.core
 
-    texts = [json.loads(l)["text"] for l in open(a.data, encoding="utf-8") if l.strip()]
-    cut = max(1, int(len(texts) * 0.05))
-    valid, train = texts[:cut], texts[cut:]
-    emit("data", examples=len(texts), train=len(train), valid=len(valid))
+    train, valid = _rows(a.data)
+    emit("data", examples=len(train) + len(valid), train=len(train), valid=len(valid))
 
     adapter = os.path.join(a.out, "adapter")
     os.makedirs(adapter, exist_ok=True)
@@ -506,7 +592,7 @@ def train_mlx(a):
     # What a saved adapter must match to be continued. Sequence length and batch size may change between
     # attempts - finetune.py lowers them after running out of memory - so progress is counted in examples.
     recipe = {"lora": lora_params, "lr": a.lr, "epochs": a.epochs, "accum": a.accum, "train": len(train),
-              "seed": a.seed}
+              "seed": a.seed, "data": _file_hash(a.data), "loss": "answer"}
     goal = math.ceil(len(train) * a.epochs)
     prog = _read_json(os.path.join(adapter, "progress.json"))
     if prog.get("recipe") != recipe:
@@ -557,11 +643,11 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
          total=sum(v.size for _, v in tree_flatten(model.parameters())),
          targets=sorted({k.split(".")[-2] for k, _ in trainable}))
 
-    enc = [_encode(tokenizer, t) for t in train]
-    venc = [ids for ids in (_encode(tokenizer, t) for t in valid[:25]) if len(ids) > 1]
+    enc = [_example(tokenizer, r) for r in train]
+    venc = [e for e in (_example(tokenizer, r) for r in valid[:VALID]) if len(e[0]) - 1 > e[1]]
     want = max(64, a.seq_len)
     stream = []                                     # real tokens to measure steps with
-    for ids in enc:
+    for ids, _ in enc:
         stream += ids
         if len(stream) > want:
             break
@@ -575,7 +661,7 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
             clear()
         _memory_now()
         try:
-            mx.eval(loss_and_grad(model, tokens))
+            mx.eval(loss_and_grad(model, tokens, 0))
         except RuntimeError as e:
             if not re.search(r"memory|malloc", str(e), re.I):
                 raise
@@ -600,10 +686,14 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
     if max_len < want:
         emit("warn", msg="only " + str(max_len) + " of the configured " + str(want) + " tokens fit in the free "
                          "memory, so each example is cut there")
-    cut = sum(len(ids) - 1 > max_len for ids in enc)
+    cut = sum(len(ids) - 1 > max_len for ids, _ in enc)
     if cut:
         emit("warn", msg=str(cut) + " of " + str(len(enc)) + " training examples are longer than " + str(max_len) +
                          " tokens; the rest of each is not trained on")
+    blind = sum(first >= min(len(ids) - 1, max_len) for ids, first in enc)
+    if blind:
+        emit("warn", msg=str(blind) + " of " + str(len(enc)) + " training examples have no answer within the first " +
+                         str(max_len) + " tokens - the exercise alone fills them - and are skipped")
     per_update = max(1, a.batch) * max(1, a.accum)
     moments = os.path.join(adapter, "resume_optimizer.safetensors")
     state = _saved_moments(moments, trainable) if seen and prog.get("updates") else None
@@ -625,10 +715,26 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
                                   ("with AdamW's state saved alongside" if state else
                                    "AdamW starting afresh (no state was saved with it)"))
 
-    def save(path, arrays):
+    def save(path, arrays, metadata=None):
         tmp = path[:-len(".safetensors")] + ".partial.safetensors"    # MLX insists on the extension
-        mx.save_safetensors(tmp, arrays)
+        if metadata:
+            mx.save_safetensors(tmp, arrays, metadata=metadata)
+        else:
+            mx.save_safetensors(tmp, arrays)
         os.replace(tmp, path)
+
+    # The adapter with the lowest validation loss so far, which is the one merged at the end rather than the last:
+    # later epochs can overfit. Its step and loss travel inside the file, so a resumed run knows what it holds.
+    best_path = os.path.join(adapter, "best.safetensors")
+    best = {"loss": None, "step": None}
+    if seen and os.path.exists(best_path):
+        meta = _st_metadata(best_path)
+        try:
+            best.update(loss=float(meta["loss"]), step=int(meta["step"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    elif os.path.exists(best_path):
+        os.remove(best_path)                # from a training that is not the one being continued
 
     def checkpoint(done):
         """What a resumed run needs to carry on as if it had never stopped: AdamW's moments and how many updates
@@ -643,39 +749,53 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
                      "updates": int(opt.state["step"].item()) if m else 0})
 
     def validate(step):
+        """Mean loss over the validation answers, weighted by their length; a new lowest is kept in best_path."""
         model.eval()
         total = count = 0
-        for ids in venc:
+        for ids, first in venc:
             ids = ids[:max_len + 1]
-            total += loss_fn(model, mx.array([ids], dtype=mx.int32)).item() * (len(ids) - 1)
-            count += len(ids) - 1
+            n = len(ids) - 1 - first
+            if n > 0:
+                total += loss_fn(model, mx.array([ids], dtype=mx.int32), first).item() * n
+                count += n
         model.train()
-        emit("val", step=step, loss=round(total / max(1, count), 4))
+        loss = total / count if count else None
+        emit("val", step=step, loss=None if loss is None else round(loss, 4))
+        if step and loss is not None and (best["loss"] is None or loss < best["loss"]):
+            best.update(loss=loss, step=step)
+            save(best_path, dict(tree_flatten(model.trainable_parameters())), {"step": str(step), "loss": repr(loss)})
 
     every = max(25, a.save_steps, goal // 50)
     if not seen:
         validate(0)
-    acc, acc_n, perm = None, 0, None
+    acc, acc_n, perm, routed = None, 0, None, False
     for i in range(seen, goal):
         epoch, pos = divmod(i, len(enc))
         if perm is None or pos == 0:
             perm = np.random.default_rng(a.seed + epoch).permutation(len(enc))
-        ids = enc[perm[pos]][:max_len + 1]
-        loss, grads = loss_and_grad(model, mx.array([ids], dtype=mx.int32))
-        if i == seen and not CHUNK_CALLS[0] and any(hasattr(layer, "linear_attn") for layer in model.layers):
-            emit("warn", msg="the linear-attention recurrence was replaced but training never called it: this "
-                             "mlx-lm reaches it another way, so its memory use is mlx-lm's")
-        acc = grads if acc is None else tree_map(lambda x, y: x + y, acc, grads)
-        acc_n += 1
+        ids, first = enc[perm[pos]]
+        ids = ids[:max_len + 1]
+        loss = None
+        if len(ids) - 1 > first:            # an answer that starts past max_len leaves nothing to train on
+            loss, grads = loss_and_grad(model, mx.array([ids], dtype=mx.int32), first)
+            if not routed:
+                routed = True
+                if not CHUNK_CALLS[0] and any(hasattr(layer, "linear_attn") for layer in model.layers):
+                    emit("warn", msg="the linear-attention recurrence was replaced but training never called it: "
+                                     "this mlx-lm reaches it another way, so its memory use is mlx-lm's")
+            acc = grads if acc is None else tree_map(lambda x, y: x + y, acc, grads)
+            acc_n += 1
         norm = None
-        if acc_n == per_update or i + 1 == goal:
+        if acc is not None and (acc_n == per_update or i + 1 == goal):
             grads, norm = optim.clip_grad_norm(tree_map(lambda x: x / acc_n, acc), 1.0)
             opt.update(model, grads)
             acc, acc_n = None, 0
-        mx.eval([loss, model.trainable_parameters(), opt.state] + ([acc] if acc is not None else []))
+        mx.eval(([loss] if loss is not None else []) + [model.trainable_parameters(), opt.state] +
+                ([acc] if acc is not None else []))
         active, cached, peak = _memory_now()
-        emit("step", step=i + 1, max_steps=goal, loss=round(loss.item(), 4), lr=_num(opt.learning_rate),
-             tokens=len(ids) - 1, peak_gb=peak, active_gb=active, cache_gb=cached,
+        emit("step", step=i + 1, max_steps=goal, loss=None if loss is None else round(loss.item(), 4),
+             lr=_num(opt.learning_rate), tokens=len(ids) - 1, answer_tokens=max(0, len(ids) - 1 - first),
+             peak_gb=peak, active_gb=active, cache_gb=cached,
              grad_norm=None if norm is None else round(_num(norm), 4), epoch=round((i + 1) / len(enc), 3))
         if (i + 1) % max(1, a.save_steps) == 0 and i + 1 < goal:
             checkpoint(i + 1)
@@ -683,16 +803,22 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
         if (i + 1) % every == 0 or i + 1 == goal:
             validate(i + 1)
 
-    save(os.path.join(adapter, "adapters.safetensors"), dict(tree_flatten(model.trainable_parameters())))
+    final = os.path.join(adapter, "adapters.safetensors")
+    if best["step"] is not None and os.path.exists(best_path):
+        os.replace(best_path, final)
+        kept = {"kept_step": best["step"], "val_loss": round(best["loss"], 4)}
+    else:
+        save(final, dict(tree_flatten(model.trainable_parameters())))
+        kept = {"kept_step": goal, "val_loss": None}
     _write_json(os.path.join(adapter, "adapter_config.json"),
                 {"fine_tune_type": "lora", "num_layers": len(model.layers), "lora_parameters": lora_params,
                  "model": a.base})
     _write_json(os.path.join(adapter, "progress.json"),
-                {"recipe": recipe, "seen": goal, "goal": goal, "max_len": max_len, "finished": True})
+                {"recipe": recipe, "seen": goal, "goal": goal, "max_len": max_len, "finished": True, **kept})
     for path in (keep, moments):
         if os.path.exists(path):
             os.remove(path)
-    emit("trained", adapter=adapter, replaced_recurrence_calls=CHUNK_CALLS[0])
+    emit("trained", adapter=adapter, replaced_recurrence_calls=CHUNK_CALLS[0], **kept)
 
 
 # ---------------------------------------------------------------- the adapter, merged into the base's own files

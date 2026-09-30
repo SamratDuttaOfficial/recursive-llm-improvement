@@ -196,16 +196,31 @@ The refused rewrite is still stored on the record - the detail view shows it wit
 not go into the corpus. `reverted` in the round table and on the dashboard counts how often this happens;
 a high number means the rewrite step is hurting more than helping.
 
-**Every rewrite is saved, and every saved answer is trained on.** There is no quality gate anywhere in the
-pipeline: one exercise in, one training pair out, and the whole corpus goes into the fine-tune. A rewrite
+**Every rewrite is saved.** The corpus has no quality gate: one exercise in, one training pair out. A rewrite
 that still has checker errors is written all the same and flagged `clean: false`, because what the model
 does badly is a fact about the model, and dropping it would hide that from the very report meant to show
-it. The checker score is on every row, so the spread is visible without anything being thrown away.
+it. The checker score is on every row, so the spread is visible without anything being thrown away. What
+the fine-tune then trains on is only the correct answers - see the next section.
 
 ## Phase 2 - fine-tuning (`finetune.py`)
 
 LoRA (rank 32, alpha 64, 3 epochs, cosine schedule) over the corpus in ChatML format, then merged
 into the base weights and converted to GGUF so the next round can be served by the same `llama-server`.
+
+**Only the correct answers are trained on** (`finetune.only_correct`, on by default). Every corpus answer is
+run through the checker again first, and kept only if its code is complete, the checker finds no errors in
+it, it runs, and every check it carries holds - its own `assert` examples, doctests and `test_*` functions -
+of which it must have at least one, since an answer with nothing to check it against is not known to be
+right. The log says how many were kept and why the rest were not. Trained on unchecked, the model learns its
+own mistakes along with everything else, and this is the only signal of correctness the loop has.
+`--all-answers` trains on everything instead. The verdicts are kept in the version's folder, so a stopped
+run does not check the same answers twice.
+
+**Trained on the answer, in the shape it is asked.** Each example is the prompt exactly as the model is
+later asked with it - ChatML ending in the empty reasoning block that turns Qwen3.5's thinking off - then the
+answer, and the loss is taken on the answer only: the model is shown the system prompt and the exercise, not
+taught to write them. Validation runs throughout on 25 held-out answers, and the adapter kept is the one with
+the lowest validation loss, not the last - the third epoch tends to overfit.
 
 - **NVIDIA / CPU**: PyTorch + PEFT, bf16, gradient checkpointing, resumed from the last `checkpoint-N`.
 - **Apple silicon**: MLX LoRA on the unified-memory GPU, in a training loop of `train_worker.py`'s own so that
@@ -262,6 +277,12 @@ tells you to generate another round first (`--force` overrides). Each version ke
 weights and GGUF - roughly 3 GB - and the run prints where that went so you can delete `ckpt/` once you are
 happy with it.
 
+**Removing a version.** `python finetune.py --remove v1` deletes v1 for good - its registry entry, its
+training folder, its GGUF and its benchmark results, which the benchmark keys by name and would otherwise hand
+to the next v1 - so the next `finetune.py` trains v1 again from scratch. The rounds v1 wrote as the generator
+are moved to `state/<run>/removed/`, not deleted, and a pipeline cycle that was answering with v1 is closed,
+so the pipeline starts a new one. A version that another was stacked on has to go after it.
+
 ## Phase 3 - benchmarking (`benchmark.py`)
 
 Which benchmarks run is `benchmarks.use` in `config.json`; every one it knows how to fetch is described in
@@ -295,10 +316,15 @@ has **not** memorised. That second column is the one to read.
 harness; a problem whose official solution does not pass here is dropped rather than counted as a model
 failure. LBPP: 161 of 162. EvoEval: 199 of 200.
 
-**The base model is measured once and never again.** Later runs only measure what has no results yet
-(`--force` measures again). The base keeps whichever identity it was first measured under in full, so
-converting it to f16 during the first fine-tune - which is what makes the comparison like-for-like - cannot
-give it a second identity and quietly earn it a second benchmark run.
+**The base model is measured once, like for like.** Later runs only measure what has no results yet
+(`--force` measures again). Once the first fine-tune has converted the base to f16, the base is measured as
+`base_f16` - the same precision as the versions - and every version is compared with that; a base measured
+earlier as Ollama's quantised copy stays in the table but is not what the versions are compared with.
+
+**Every model is decoded the same way:** greedy, with no repetition penalties. Ollama gives the base a
+presence penalty of 1.5, and the versions are served with the base's sampling defaults, so a version writing
+the corpus samples the way the base did; the benchmark turns the penalties off for all of them, so a
+difference in score comes from the weights and nothing else. Each answer on disk records how it was decoded.
 
 **`--limit N` is a quick look, not a result.** It answers the first N problems of each benchmark and marks the
 scores partial; the next run without it answers only the rest. Each version is compared with the base on the
@@ -356,8 +382,9 @@ state/<run>/rounds/round_001/questions.json   the exercise set
 state/<run>/rounds/round_001/q_r001q007.json  one exercise: every answer, every judge, verdict, rewrite
 state/<run>/corpus/round_001.jsonl            one training pair per exercise, nothing filtered out
 state/<run>/corpus/<anything>/*.jsonl         another machine's corpus, merged in - see below
-state/<run>/ft/v1/                            dataset, checkpoints, adapter, merged model, progress
+state/<run>/ft/v1/                            dataset, correctness verdicts, checkpoints, adapter, merged model
 state/<run>/ft/v2/                            the next version (from base, or stacked on v1)
+state/<run>/removed/v1-<time>/                the rounds a removed version had written
 state/<run>/bench/<model>/<bench>/            one file per problem, plus the summaries
 state/<run>/bench/comparison.json             the table
 models/registry.json                          base + every version, and where their weights are
@@ -424,8 +451,10 @@ done, however many runs that takes - `--new` / `--no-new` - `--workers N` -
 
 **`finetune.py`** `--rounds 1,2` which corpus rounds - `--corpus PATH` another machine's corpus, repeatable
 - `--from-model base|latest|v1` retrain from base or
-stack on a version - `--version v4` name it - `--epochs`, `--lr`, `--rank`, `--seq-len`, `--batch`,
-`--accum` - `--load-4bit` - `--force` train despite the duplicate guard - `--restart` - `--no-gguf`
+stack on a version - `--version v4` name it - `--all-answers` train on every answer, not only the correct
+ones - `--remove v1` delete a version so it can be trained again - `--epochs`, `--lr`, `--rank`,
+`--seq-len`, `--batch`, `--accum` - `--load-4bit` - `--force` train despite the duplicate guard -
+`--restart` - `--no-gguf`
 
 **`benchmark.py`** `--models base,v1` - `--benchmarks lbpp,evoeval` any names from `benchmarks.catalog` -
 `--splits evoeval=subtle,creative` - `--limit N` - `--no-probe` skip the contamination screen -

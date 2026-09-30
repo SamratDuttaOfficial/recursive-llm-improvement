@@ -312,7 +312,9 @@ function configCard(s) {
     add("from", c.from_model);
     add("recipe", "LoRA r=" + c.rank + " alpha=" + c.alpha + ", " + c.epochs + " epochs, lr " + c.lr +
       ", seq " + c.seq_len + ", batch " + c.batch + "x" + c.accum);
-    add("train on", "every answer in the corpus" + (c.rounds ? ", rounds " + c.rounds : ""));
+    add("train on", (c.only_correct ? "the correct answers in the corpus (they run and pass their own asserts)"
+                                    : "every answer in the corpus") + (c.rounds ? ", rounds " + c.rounds : ""));
+    add("loss", "on the answer only; the adapter kept is the one with the lowest validation loss");
   } else if (s.kind === "benchmark") {
     add("benchmarks", (c.benchmarks || Object.keys(c.catalog || {}).join(", ")));
     add("sampling", "temperature " + c.temp + ", up to " + c.solve_tokens + " tokens");
@@ -372,7 +374,8 @@ function drawOverview() {
     const step = t.step || p.step || 0, max = t.max_steps || p.max_steps || 0;
     h += `<div class="kpis">
       ${kpi("version", esc(p.version || "-"), "from " + esc((s.config || {}).from_model || "base"))}
-      ${kpi("training examples", nn((p.dataset || {}).examples), "every answer in the corpus")}
+      ${kpi("training examples", nn((p.dataset || {}).examples),
+            (p.dataset || {}).only_correct ? "the correct answers in the corpus" : "every answer in the corpus")}
       ${kpi("step", step + "<small>/" + (max || "?") + "</small>", pct(step, max) + "%")}
       ${kpi("loss", t.loss !== undefined && t.loss !== null ? Number(t.loss).toFixed(4) : "-",
             "epoch " + nn(t.epoch))}
@@ -608,7 +611,7 @@ function benchTable(rows, deltas) {
   let h = "";
   Object.keys(byBench).sort().forEach(b => {
     const rs = byBench[b].slice().sort((x, y) => (x.model > y.model ? 1 : -1));
-    const baseRow = rs.find(r => r.model.startsWith("base"));
+    const baseRow = rs.find(r => r.model === "base_f16") || rs.find(r => r.model === "base");
     h += `<h2>${esc(b)} <span class="muted small">pass@1, unit tests actually executed</span></h2>
       <div class="card"><table><thead><tr><th>model</th><th style="width:34%">pass@1</th>
       <th class="num">passed</th><th class="num">unseen only</th><th class="num">vs base</th>
@@ -616,10 +619,11 @@ function benchTable(rows, deltas) {
     rs.forEach(r => {
       // once worked out, the comparison is on the problems both have answered; until then, the rows' own rates
       const x = (deltas || []).find(e => e.model === r.model && e.bench === b);
+      const versus = baseRow && !r.model.startsWith("base");     // the base rows are what is compared against
       const d = deltas && deltas.length ? (x ? x.delta : null)
-        : baseRow && r !== baseRow ? +(r.pass_rate - baseRow.pass_rate).toFixed(1) : null;
+        : versus ? +(r.pass_rate - baseRow.pass_rate).toFixed(1) : null;
       const dc = deltas && deltas.length ? (x ? x.delta_clean : null)
-        : baseRow && r !== baseRow && r.pass_rate_clean != null && baseRow.pass_rate_clean != null
+        : versus && r.pass_rate_clean != null && baseRow.pass_rate_clean != null
           ? +(r.pass_rate_clean - baseRow.pass_rate_clean).toFixed(1) : null;
       h += `<tr class="click" data-model="${esc(r.model)}" data-bench="${esc(b)}">
         <td><code>${esc(r.model)}</code>${r.complete ? "" : ' <span class="chip warn">partial</span>'}</td>

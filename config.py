@@ -107,6 +107,7 @@ DEFAULTS = {
         "alpha": 64,
         "save_steps": 25,
         "min_examples": 20,
+        "only_correct": True,
         "load_4bit": False,
         "force_torch": False,
         "gguf": True,
@@ -253,8 +254,10 @@ COMMENTS = {
                "actual run of the code. `penalties` and `bonuses` are points off and on a 0-100 score.",
     "finetune": "Phase 2 (finetune.py). `from_model` is `base` for a clean run from the untouched model\n"
                 "on the whole corpus, or `latest`/`v1` to keep training that version's own weights on\n"
-                "the rounds it has not seen yet. Every answer in the chosen rounds is trained on;\n"
-                "nothing here filters the corpus.",
+                "the rounds it has not seen yet. `only_correct` trains only on the answers that run, pass\n"
+                "their own asserts and have no checker errors; false trains on every answer. The corpus\n"
+                "itself always keeps every answer. The loss is taken on the answer only, and the adapter\n"
+                "kept is the one with the lowest validation loss.",
     "benchmarks": "Phase 3 (benchmark.py). `use` picks from `catalog` below; anything named there is\n"
                   "downloaded on first use. `probe` is the memorization screen - every problem is shown\n"
                   "half-finished to the base model, and one it can reproduce verbatim is flagged, so\n"

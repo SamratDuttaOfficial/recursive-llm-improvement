@@ -624,7 +624,9 @@ class Ollama:
         body = {"model": model, "stream": True, "keep_alive": -1, "think": False,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "options": {"num_predict": max_tokens, "temperature": temp, "num_ctx": s.ctx,
-                            **{k: v for k, v in (sampler or {}).items() if k in ("top_k", "top_p", "min_p")}}}
+                            **{k: v for k, v in (sampler or {}).items()
+                               if k in ("top_k", "top_p", "min_p", "presence_penalty", "frequency_penalty",
+                                        "repeat_penalty")}}}
         g = gen or Gen(max_tokens=max_tokens, model=model)
         for attempt in range(20):
             check_stop()
@@ -735,6 +737,14 @@ def gpu_backend_libs(libdir):
             if re.match(r"(lib)?ggml-(cuda|hip|rocm|vulkan|metal)\.(dll|so|dylib)$", f):
                 out.append(os.path.join(libdir, sub, f))
     return out
+
+
+def chatml_prompt(system, user):
+    """What every model here is asked with: ChatML, ending in the empty reasoning block that turns Qwen3.5's
+    thinking off. finetune.py builds its training text with this same function, so a fine-tuned version is trained
+    on exactly the prompt it is later asked with."""
+    return ("<|im_start|>system\n" + system + "<|im_end|>\n<|im_start|>user\n" + user +
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
 class LlamaServer:
@@ -920,8 +930,7 @@ class LlamaServer:
 
     def chat(s, model, system, user, max_tokens, temp, gen=None, sampler=None):
         """Streams into `gen`; closing the connection makes llama-server free the slot immediately."""
-        prompt = ("<|im_start|>system\n" + system + "<|im_end|>\n<|im_start|>user\n" + user +
-                  "<|im_end|>\n<|im_start|>assistant\n" + "<think>\n\n</think>\n\n")
+        prompt = chatml_prompt(system, user)
         body = {"prompt": prompt, "n_predict": max_tokens, "temperature": temp, "stream": True,
                 "cache_prompt": True, "stop": ["<|im_end|>", "<|endoftext|>"]}
         for k, v in s.params.items():
@@ -1071,8 +1080,12 @@ class Backend:
                     return srv
             port = s.port + 3 * len(set(id(x) for x in s.servers.values()))
             exe = s.ollama.binary()
-            srv = LlamaServer(port, ctx, s.slots, entry["gguf"], entry.get("params"), exe,
-                              name=role + ":" + entry["id"])
+            # A GGUF made here - the f16 base, a fine-tuned version - has no sampling defaults of its own and is
+            # sampled with the base model's (Ollama's presence_penalty 1.5 among them), as it already is when
+            # Ollama serves it. Otherwise a version writing the corpus would sample differently from the base
+            # that wrote the rounds before it, for a reason that has nothing to do with its training.
+            params = entry.get("params") or (Registry.load().get("base") or {}).get("params")
+            srv = LlamaServer(port, ctx, s.slots, entry["gguf"], params, exe, name=role + ":" + entry["id"])
             Stop.on_exit(srv.stop)
             if s.prefer != "ollama" and srv.available() and srv.setup():
                 s.servers[role], s.entries[role] = srv, entry

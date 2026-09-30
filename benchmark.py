@@ -4,8 +4,9 @@
     python benchmark.py
 
 Downloads the benchmarks, runs every registered model that has no results yet, executes the real unit tests
-in a separate process with a timeout, and writes a comparison table. The base model is measured once and
-then never again - later runs only measure the new fine-tuned versions.
+in a separate process with a timeout, and writes a comparison table. The base model is measured once - as its
+f16 copy once a fine-tune has made one, like for like with the versions - and later runs only measure the new
+fine-tuned versions. Every model is decoded the same way (DECODING below).
 
 Which benchmarks run is `benchmarks.use` in `config.json`, and every one it can fetch is described in
 `benchmarks.catalog` there - repository, file, how its columns map onto a problem, and which harness
@@ -53,6 +54,11 @@ CONFIG_MAP = {
     "slots": "parallel.slots", "backend": "parallel.backend",
     "port": "server.port_benchmark", "dash_port": "ui.ports.benchmark",
 }
+
+# How every model is decoded here, whatever sampling defaults it carries: no repetition penalties, and greedy at
+# temperature 0 - the standard pass@1 setting. Ollama gives the base model a presence_penalty of 1.5 and the
+# versions are served with the base's defaults; left in place, that penalty would take part in every comparison.
+DECODING = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repeat_penalty": 1.0}
 
 
 # ---------------------------------------------------------------- safe decoding of packed dataset fields
@@ -702,10 +708,11 @@ class Bench:
                 if functional else prompts.fill(prompts.BENCH_USER_STDIN, prompt=item["prompt"]))
         g = Gen(tag=model_id + " " + item["task_id"], kind="solve", max_tokens=a.solve_tokens,
                 model=model_id, meta={"task": item["task_id"], "bench": item["bench"]})
+        sampler = dict(DECODING, **({"top_k": 1} if a.temp == 0 else {}))
         t0 = time.time()
         try:
             text, info = s.backend.chat("gen", prompts.BENCH_SYSTEM, user, a.solve_tokens, a.temp,
-                                        gen=g, sampler={"top_k": 1} if a.temp == 0 else None)
+                                        gen=g, sampler=sampler)
             g.done()
         except Interrupted:
             g.done("interrupted")
@@ -720,7 +727,7 @@ class Bench:
                "passed": bool(verdict["ok"]), "why": verdict["why"], "secs": round(time.time() - t0, 1),
                "tokens": info.get("out"), "code": code, "answer": text[:20000],
                "stderr": verdict.get("out", "")[:400], "difficulty": item.get("difficulty"),
-               "date": item.get("date"), "when": time.time()}
+               "date": item.get("date"), "decoding": dict(sampler, temperature=a.temp), "when": time.time()}
         write_json(p, rec)
         s.active.pop(item["task_id"], None)
         return rec
@@ -781,11 +788,10 @@ def table(rows):
 
 def deltas(rows, run_dir):
     """Each version against the base, on the problems both have answered - a --limit run answers only the first
-    few - and on those of them the base does not look to have memorised."""
-    base = {}
-    for r in rows:
-        if r["model"] in ("base", "base_f16") and r["n"] > base.get(r["bench"], {}).get("n", -1):
-            base[r["bench"]] = r
+    few - and on those of them the base does not look to have memorised. The base is its f16 copy wherever that
+    has been measured: the same precision as the versions, decoded the same way."""
+    base = {r["bench"]: r for r in rows if r["model"] == "base"}
+    base.update({r["bench"]: r for r in rows if r["model"] == "base_f16"})
     out = []
     for r in rows:
         b = base.get(r["bench"])
@@ -810,7 +816,8 @@ def deltas(rows, run_dir):
                   " pts") if d["delta_clean"] is not None else ""
             lines.append("  " + d["model"].ljust(8) + " " + d["bench"].ljust(8) + "  " +
                          w(sign + str(d["delta"]) + " pts", "green" if d["delta"] > 0 else
-                           ("red" if d["delta"] < 0 else "dim")) + cl + w("   (" + str(d["n"]) + " problems)", "dim"))
+                           ("red" if d["delta"] < 0 else "dim")) + cl +
+                         w("   (" + str(d["n"]) + " problems, against " + d["base"] + ")", "dim"))
         Log.block(lines + [""])
     return out
 
@@ -845,14 +852,12 @@ def make_api(a, bench_obj, holder):
     return api
 
 
-def base_id(benches, finished, reg):
-    """The name the base model is measured under: whatever it was first measured as in full, so it is never
-    measured twice under two names. A base not yet measured in full - not at all, or only by a --limit run -
-    takes the f16 identity when there is one: like for like with the fine-tuned versions, which are f16 too."""
-    for name in ("base", "base_f16"):
-        if any(finished(name, b) for b in benches):
-            return name
-    return "base_f16" if reg.get("base_f16") else "base"
+def base_id(reg):
+    """The name the base model is measured under: its f16 copy once the first fine-tune has made one - the same
+    precision as the fine-tuned versions - and Ollama's quantised copy before that. A base measured only as
+    Ollama's is measured again as base_f16 once there is one, because the two are not like for like: besides the
+    precision, the Ollama copy used to be decoded with a presence penalty that the versions never had."""
+    return "base_f16" if (reg.get("base_f16") or {}).get("gguf") else "base"
 
 
 def main():
@@ -950,26 +955,17 @@ def main():
         return
 
     # Which models still need measuring, decided problem by problem: a --limit run answers the first few
-    # problems, and it is neither taken for the whole benchmark nor repeated. The base model is measured in full
-    # once and never again - so whichever name it was first measured under ("base", or "base_f16" once a
-    # fine-tune has produced the same weights at full precision) is the name it keeps. Without this, converting
-    # the base to f16 during the first fine-tune would silently give it a second identity and the base would be
-    # benchmarked all over again.
+    # problems, and it is neither taken for the whole benchmark nor repeated. The base model is measured once
+    # under the name base_id() gives it.
     full = {b: load_bench(b, a) for b in benches}           # a cached file after the first run
     runs = {b: capped(b, full[b], a) for b in benches}
     answered = lambda m, b, items: sum(os.path.exists(result_file(run_dir, m, b, it["task_id"])) for it in items)
-    finished = lambda m, b: answered(m, b, full[b]) == len(full[b])
     if not want:
-        want = [base_id(benches, finished, reg)] + [v["id"] for v in reg.get("versions", [])]
+        want = [base_id(reg)] + [v["id"] for v in reg.get("versions", [])]
     plan = []
     for m in want:
         for b in benches:
-            other = {"base": "base_f16", "base_f16": "base"}.get(m)
-            if other and not a.force and finished(other, b) and not finished(m, b):
-                done = summarize(run_dir, other, b, full[b], contamination(b))
-                why = "the base model was already measured on " + b + " as '" + other + "'"
-                again = "it is never re-measured"
-            elif not a.force and answered(m, b, runs[b]) == len(runs[b]):
+            if not a.force and answered(m, b, runs[b]) == len(runs[b]):
                 done = summarize(run_dir, m, b, full[b], contamination(b))
                 why, again = m + " on " + b + " was already measured", "not re-running it"
             else:
