@@ -15,14 +15,18 @@ Re-running skips everything already done; an interrupted training resumes from i
 The recipe - epochs, LoRA rank, learning rate, sequence length, what a corpus answer has to score to be
 trained on - lives in the `finetune` block of `config.json`, and a flag overrides it for one run.
 """
-import argparse, hashlib, json, os, re, shutil, subprocess, sys, time
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time
 
 from common import (DATA, Dash, Interrupted, LOGS, Log, MODELS, Registry, STATE, Stop, Venv, WIN, ARM_MAC,
                     common_state, download, fmt_t, gpu_status, log, phase, read_json, read_jsonl, write_json)
 import config as conf
 import prompts
 
-CONVERT_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
+# llama.cpp's converter is convert_hf_to_gguf.py plus the `conversion` package and the `gguf-py` that sit beside
+# it, all from the same revision: the script on its own is a shell that fails on `import conversion`. One source
+# archive of llama.cpp has all three.
+CONVERTER_URL = "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/master"
+CONVERTER_PARTS = ("convert_hf_to_gguf.py", "conversion/", "gguf-py/")
 PHASES = ["dataset", "deps", "base", "train", "merge", "gguf", "register"]
 LIVE_TRAIN = {"steps": [], "state": {}, "log": []}
 # How running out of memory reads from PyTorch (CUDA, MPS) and from MLX, whose Metal driver says "Insufficient
@@ -453,21 +457,69 @@ def handle_progress(ev, prog, save, clock):
 
 
 # ---------------------------------------------------------------- GGUF conversion
+def converter():
+    """llama.cpp's Hugging Face -> GGUF converter, unpacked once into data/llama.cpp-convert/: the script, its
+    `conversion` package and the gguf-py of the same revision, which the script puts ahead of any installed gguf
+    by itself. It is unpacked into a temporary folder first, so an interrupted run never leaves half of it."""
+    home = os.path.join(DATA, "llama.cpp-convert")
+    script = os.path.join(home, "convert_hf_to_gguf.py")
+    if os.path.exists(script):
+        return script
+    archive = download(CONVERTER_URL, os.path.join(DATA, "llama.cpp-source.tar.gz"))
+    tmp = home + ".partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        with tarfile.open(archive) as t:
+            for m in t.getmembers():
+                rel = m.name.split("/", 1)[1] if "/" in m.name else ""     # below the archive's top folder
+                parts = rel.split("/")
+                if m.isfile() and rel.startswith(CONVERTER_PARTS) and ".." not in parts:
+                    out = os.path.join(tmp, *parts)
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    with t.extractfile(m) as src, open(out, "wb") as f:
+                        shutil.copyfileobj(src, f)
+        why = None if os.path.exists(os.path.join(tmp, "convert_hf_to_gguf.py")) else "no convert_hf_to_gguf.py in it"
+    except Exception as e:          # a download cut short, most likely
+        why = repr(e)[:160]
+    os.remove(archive)
+    if why:
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.exit("could not unpack llama.cpp's converter from its source archive (" + why + "); re-run to "
+                 "download it again")
+    shutil.rmtree(home, ignore_errors=True)
+    os.replace(tmp, home)
+    return script
+
+
 def convert_gguf(a, hf_dir, out_gguf, label):
+    """A Hugging Face model folder -> one f16 GGUF, the file llama-server loads. The converter's own output
+    goes to logs/gguf.log, and when it fails, the end of it is shown. Returns the GGUF, or None."""
     if os.path.exists(out_gguf):
         return out_gguf
-    script = os.path.join(DATA, "convert_hf_to_gguf.py")
-    if not os.path.exists(script):
-        download(CONVERT_URL, script)
-    Venv.need(["gguf"], ["gguf"], note="gguf (GGUF writer)")
+    script = converter()
+    # the converter needs torch and transformers; gguf-py comes with it and needs the other four
+    Venv.need(["numpy", "yaml", "tqdm", "requests"], ["numpy", "pyyaml", "tqdm", "requests"],
+              note="what gguf-py needs")
+    Venv.need(["transformers"], ["transformers"], note="transformers (the tokenizer)")
     Venv.need(["torch"], ["torch"], index=torch_index(), note="PyTorch")
     log("gguf", "converting " + label + " to GGUF f16 (this is what llama-server loads)")
     os.makedirs(os.path.dirname(out_gguf), exist_ok=True)
-    r = Venv.run([script, hf_dir, "--outfile", out_gguf, "--outtype", "f16"])
-    if r.returncode != 0 or not os.path.exists(out_gguf):
-        log("warn", "GGUF conversion failed for " + label + "; the merged Hugging Face model is still in " +
-            hf_dir, "yellow")
+    tmp = out_gguf + ".partial"         # renamed when complete, so a cut-off file is never taken for a GGUF
+    env = {k: v for k, v in os.environ.items() if k != "NO_LOCAL_GGUF"}    # always the gguf-py beside it
+    path = os.path.join(LOGS, "gguf.log")
+    with open(path, "a", encoding="utf-8") as lf:
+        lf.write("\n===== " + time.strftime("%Y-%m-%d %H:%M:%S") + " " + label + ": " + hf_dir + " =====\n")
+        lf.flush()
+        r = Venv.run([script, hf_dir, "--outfile", tmp, "--outtype", "f16"], stdout=lf, stderr=subprocess.STDOUT,
+                     env=env)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 4096))
+            tail = [l.strip() for l in re.split(r"[\r\n]+", f.read().decode("utf-8", "replace")) if l.strip()]
+        log("warn", "GGUF conversion failed for " + label + " (exit " + str(r.returncode) + "): " +
+            (tail[-1][:240] if tail else "no output") + " - the whole output is in logs/gguf.log", "yellow")
         return None
+    os.replace(tmp, out_gguf)
     log("gguf", label + " -> " + out_gguf + " (" +
         format(os.path.getsize(out_gguf) / 1e9, ".2f") + " GB)", "green")
     return out_gguf
@@ -488,6 +540,16 @@ def make_api(a, prog_holder):
 
 
 # ---------------------------------------------------------------- main
+def unconverted(a):
+    """The newest version when it was registered without its GGUF - its conversion failed, back when a failed
+    conversion did not stop the run - and so can be neither benchmarked nor served: the next run finishes it
+    rather than train a new version on the same data. Its id, or None."""
+    last = (Registry.load().get("versions") or [None])[-1]
+    if a.version or a.no_gguf or not last or last.get("gguf") or last.get("run", a.run) != a.run:
+        return None
+    return last["id"] if os.path.exists(os.path.join(str(last.get("merged")), "config.json")) else None
+
+
 def main():
     O = conf.opt()      # a flag with no default: when it is not passed, config.json decides
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -541,6 +603,12 @@ def main():
     if not cfg.get("ui.open_browser", True):
         a.no_browser = True
     Stop.install()
+
+    todo = unconverted(a)
+    if todo:
+        a.version = todo
+        log("resume", todo + " is trained but has no GGUF, because its conversion did not finish; this run "
+                             "converts it instead of training a new version", "yellow")
 
     n = int(re.sub(r"\D", "", a.version) or 0) or Registry.next_n()
     vid = a.version or ("v" + str(n))
@@ -617,6 +685,10 @@ def main():
         if not a.no_gguf:
             phase("gguf", "converting to GGUF")
             gguf = convert_gguf(a, merged, os.path.join(MODELS, vid, vid + "-f16.gguf"), vid)
+            if not gguf:
+                sys.exit(vid + " is trained and merged, but converting it to GGUF failed (why: the end of "
+                         "logs/gguf.log), so it is not registered - the benchmark and run.py load GGUFs. Re-run to "
+                         "try the conversion again; the training is kept.")
             reg = Registry.load()
             if not (reg.get("base_f16") or {}).get("gguf"):
                 bg = convert_gguf(a, os.path.join(MODELS, "base_hf"),

@@ -614,9 +614,13 @@ function benchTable(rows, deltas) {
       <th class="num">passed</th><th class="num">unseen only</th><th class="num">vs base</th>
       <th class="num">flagged</th><th class="num">avg tokens</th></tr></thead><tbody>`;
     rs.forEach(r => {
-      const d = baseRow && r !== baseRow ? +(r.pass_rate - baseRow.pass_rate).toFixed(1) : null;
-      const dc = baseRow && r !== baseRow && r.pass_rate_clean != null && baseRow.pass_rate_clean != null
-        ? +(r.pass_rate_clean - baseRow.pass_rate_clean).toFixed(1) : null;
+      // once worked out, the comparison is on the problems both have answered; until then, the rows' own rates
+      const x = (deltas || []).find(e => e.model === r.model && e.bench === b);
+      const d = deltas && deltas.length ? (x ? x.delta : null)
+        : baseRow && r !== baseRow ? +(r.pass_rate - baseRow.pass_rate).toFixed(1) : null;
+      const dc = deltas && deltas.length ? (x ? x.delta_clean : null)
+        : baseRow && r !== baseRow && r.pass_rate_clean != null && baseRow.pass_rate_clean != null
+          ? +(r.pass_rate_clean - baseRow.pass_rate_clean).toFixed(1) : null;
       h += `<tr class="click" data-model="${esc(r.model)}" data-bench="${esc(b)}">
         <td><code>${esc(r.model)}</code>${r.complete ? "" : ' <span class="chip warn">partial</span>'}</td>
         <td><div style="display:flex;gap:8px;align-items:center"><div class="bar-bg" style="flex:1">

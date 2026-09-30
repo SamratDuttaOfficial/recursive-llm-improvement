@@ -357,7 +357,8 @@ def self_check(bench, items, a):
 
 def load_bench(name, a):
     """One benchmark, ready to run: downloaded if this is the first time, screened against its own
-    reference solutions, and cut to whatever limits the config sets."""
+    reference solutions, and cut to the problems its catalog entry selects. A --limit is applied by `capped`
+    instead: a model is done with a benchmark once it has answered all of these."""
     spec = (a.catalog or {}).get(name)
     if not spec:
         sys.exit("unknown benchmark '" + name + "'. Add it to benchmarks.catalog in " + a.config +
@@ -371,7 +372,13 @@ def load_bench(name, a):
         items = items[-int(spec["newest"]):]   # the newest problems, the least likely to be memorised
     if not a.no_self_check and spec.get("self_check", True):
         items = self_check(name, items, a)
-    limit = int(spec.get("limit") or a.limit or 0)
+    return items
+
+
+def capped(name, items, a):
+    """The problems this run works through: all of them, or the first --limit (or the catalog's `limit`). The
+    answers stay, so a later run without the limit carries on from them."""
+    limit = int(((a.catalog or {}).get(name) or {}).get("limit") or a.limit or 0)
     return items[:limit] if limit else items
 
 
@@ -614,6 +621,59 @@ def screen(backend, items, bench, a):
 
 
 # ---------------------------------------------------------------- one model on one benchmark
+def result_file(run_dir, model_id, bench, task_id):
+    return os.path.join(run_dir, model_id, bench, re.sub(r"[^\w.-]", "_", task_id) + ".json")
+
+
+def summary_file(run_dir, model_id, bench):
+    return os.path.join(run_dir, model_id, bench + ".summary.json")
+
+
+def answers(run_dir, model_id, bench):
+    """{task_id: passed} for every problem of the benchmark the model has answered."""
+    d = os.path.join(run_dir, model_id, bench)
+    out = {}
+    for f in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+        r = read_json(os.path.join(d, f)) if f.endswith(".json") else None
+        if r and "task_id" in r:
+            out[r["task_id"]] = bool(r.get("passed"))
+    return out
+
+
+def contamination(bench):
+    """The memorisation screen's verdicts as `screen` cached them, {task_id: {"memorized": ...}}."""
+    return read_json(os.path.join(DATA, "contamination_" + bench + ".json"), {}) or {}
+
+
+def summarize(run_dir, model_id, bench, items, contam):
+    """The model's score over every problem of `items` it has answered, saved beside its answers; `complete`
+    only when it has answered all of them."""
+    recs = []
+    for it in items:
+        r = read_json(result_file(run_dir, model_id, bench, it["task_id"]))
+        if r:
+            r["memorized"] = bool((contam.get(it["task_id"]) or {}).get("memorized"))
+            recs.append(r)
+    if not recs:
+        return None
+    clean = [r for r in recs if not r["memorized"]]
+    by_diff = {}
+    for r in recs:
+        d = r.get("difficulty") or "-"
+        by_diff.setdefault(d, []).append(r["passed"])
+    out = {"model": model_id, "bench": bench, "n": len(recs), "passed": sum(r["passed"] for r in recs),
+           "pass_rate": round(100 * sum(r["passed"] for r in recs) / len(recs), 1),
+           "n_clean": len(clean), "passed_clean": sum(r["passed"] for r in clean),
+           "pass_rate_clean": round(100 * sum(r["passed"] for r in clean) / len(clean), 1) if clean else None,
+           "flagged": len(recs) - len(clean),
+           "avg_tokens": round(sum(r.get("tokens") or 0 for r in recs) / len(recs)),
+           "by_difficulty": {k: {"n": len(v), "pass": sum(v),
+                                 "rate": round(100 * sum(v) / len(v), 1)} for k, v in by_diff.items()},
+           "complete": len(recs) == len(items), "of": len(items), "when": time.time()}
+    write_json(summary_file(run_dir, model_id, bench), out)
+    return out
+
+
 class Bench:
     def __init__(s, a, backend, run_dir):
         s.a, s.backend, s.dir = a, backend, run_dir
@@ -621,16 +681,15 @@ class Bench:
         s.live = {}
 
     def result_path(s, model_id, bench, task_id):
-        safe = re.sub(r"[^\w.-]", "_", task_id)
-        return os.path.join(s.dir, model_id, bench, safe + ".json")
+        return result_file(s.dir, model_id, bench, task_id)
 
     def summary_path(s, model_id, bench):
-        return os.path.join(s.dir, model_id, bench + ".summary.json")
+        return summary_file(s.dir, model_id, bench)
 
-    def solve_one(s, model_id, item):
+    def solve_one(s, model_id, item, fresh=False):
         a = s.a
         p = s.result_path(model_id, item["bench"], item["task_id"])
-        got = read_json(p)
+        got = None if fresh else read_json(p)
         if got:
             return got
         check_stop()
@@ -666,9 +725,11 @@ class Bench:
         s.active.pop(item["task_id"], None)
         return rec
 
-    def run_model(s, model_id, bench, items, contam):
+    def run_model(s, model_id, bench, items, every, contam):
+        """Answer `items` - the ones not answered yet, or all of them with --force - then score the model over
+        `every` problem of the benchmark it has answered."""
         a = s.a
-        done = [it for it in items if os.path.exists(s.result_path(model_id, bench, it["task_id"]))]
+        done = [] if a.force else [it for it in items if os.path.exists(s.result_path(model_id, bench, it["task_id"]))]
         todo = [it for it in items if it not in done]
         log("bench", model_id + " on " + bench + ": " + str(len(todo)) + " to run, " +
             str(len(done)) + " already done", "bold")
@@ -676,7 +737,7 @@ class Bench:
         workers = max(2, int(s.backend.total_slots() * 1.25))
         n_done, t0 = 0, time.time()
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(s.solve_one, model_id, it): it for it in todo}
+            futs = {ex.submit(s.solve_one, model_id, it, a.force): it for it in todo}
             try:
                 for f in cf.as_completed(futs):
                     it = futs[f]
@@ -698,33 +759,7 @@ class Bench:
             if Stop.is_set():
                 for f in futs:
                     f.cancel()
-        return s.summarize(model_id, bench, items, contam)
-
-    def summarize(s, model_id, bench, items, contam):
-        recs = []
-        for it in items:
-            r = read_json(s.result_path(model_id, bench, it["task_id"]))
-            if r:
-                r["memorized"] = bool((contam.get(it["task_id"]) or {}).get("memorized"))
-                recs.append(r)
-        if not recs:
-            return None
-        clean = [r for r in recs if not r["memorized"]]
-        by_diff = {}
-        for r in recs:
-            d = r.get("difficulty") or "-"
-            by_diff.setdefault(d, []).append(r["passed"])
-        out = {"model": model_id, "bench": bench, "n": len(recs), "passed": sum(r["passed"] for r in recs),
-               "pass_rate": round(100 * sum(r["passed"] for r in recs) / len(recs), 1),
-               "n_clean": len(clean), "passed_clean": sum(r["passed"] for r in clean),
-               "pass_rate_clean": round(100 * sum(r["passed"] for r in clean) / len(clean), 1) if clean else None,
-               "flagged": len(recs) - len(clean),
-               "avg_tokens": round(sum(r.get("tokens") or 0 for r in recs) / len(recs)),
-               "by_difficulty": {k: {"n": len(v), "pass": sum(v),
-                                     "rate": round(100 * sum(v) / len(v), 1)} for k, v in by_diff.items()},
-               "complete": len(recs) == len(items), "when": time.time()}
-        write_json(s.summary_path(model_id, bench), out)
-        return out
+        return summarize(s.dir, model_id, bench, every, contam)
 
 
 # ---------------------------------------------------------------- reporting
@@ -744,30 +779,38 @@ def table(rows):
     Log.block(lines + [""])
 
 
-def deltas(rows):
-    """base vs each version, on the uncontaminated subset where there is one."""
-    base = {r["bench"]: r for r in rows if r["model"] in ("base", "base_f16")}
+def deltas(rows, run_dir):
+    """Each version against the base, on the problems both have answered - a --limit run answers only the first
+    few - and on those of them the base does not look to have memorised."""
+    base = {}
+    for r in rows:
+        if r["model"] in ("base", "base_f16") and r["n"] > base.get(r["bench"], {}).get("n", -1):
+            base[r["bench"]] = r
     out = []
     for r in rows:
         b = base.get(r["bench"])
         if not b or r["model"] == b["model"]:
             continue
-        d = {"model": r["model"], "bench": r["bench"],
-             "delta": round(r["pass_rate"] - b["pass_rate"], 1),
-             "delta_clean": (round(r["pass_rate_clean"] - b["pass_rate_clean"], 1)
-                             if r.get("pass_rate_clean") is not None and b.get("pass_rate_clean") is not None
-                             else None)}
-        out.append(d)
+        mine, theirs = answers(run_dir, r["model"], r["bench"]), answers(run_dir, b["model"], r["bench"])
+        common = [t for t in mine if t in theirs]
+        if not common:
+            continue
+        seen = contamination(r["bench"])
+        clean = [t for t in common if not (seen.get(t) or {}).get("memorized")]
+        rate = lambda res, ids: 100 * sum(res[t] for t in ids) / len(ids)
+        out.append({"model": r["model"], "bench": r["bench"], "base": b["model"], "n": len(common),
+                    "delta": round(rate(mine, common) - rate(theirs, common), 1),
+                    "delta_clean": round(rate(mine, clean) - rate(theirs, clean), 1) if clean else None})
     if out:
         w = Log.paint
-        lines = ["", w("  change against the base model", "bold")]
+        lines = ["", w("  change against the base model, on the problems both have answered", "bold")]
         for d in out:
             sign = "+" if d["delta"] > 0 else ""
             cl = ("  |  unseen only " + ("+" if (d["delta_clean"] or 0) > 0 else "") + str(d["delta_clean"]) +
                   " pts") if d["delta_clean"] is not None else ""
-            lines.append("  " + d["model"].ljust(8) + " " + d["bench"].ljust(6) + "  " +
+            lines.append("  " + d["model"].ljust(8) + " " + d["bench"].ljust(8) + "  " +
                          w(sign + str(d["delta"]) + " pts", "green" if d["delta"] > 0 else
-                           ("red" if d["delta"] < 0 else "dim")) + cl)
+                           ("red" if d["delta"] < 0 else "dim")) + cl + w("   (" + str(d["n"]) + " problems)", "dim"))
         Log.block(lines + [""])
     return out
 
@@ -802,14 +845,13 @@ def make_api(a, bench_obj, holder):
     return api
 
 
-def base_id(run_dir, benches, reg):
-    """The name the base model is measured under: whatever it was first measured as, so it is never
-    measured twice under two names. Only a base that has never been measured takes the f16 identity."""
+def base_id(benches, finished, reg):
+    """The name the base model is measured under: whatever it was first measured as in full, so it is never
+    measured twice under two names. A base not yet measured in full - not at all, or only by a --limit run -
+    takes the f16 identity when there is one: like for like with the fine-tuned versions, which are f16 too."""
     for name in ("base", "base_f16"):
-        for b in benches:
-            s = read_json(os.path.join(run_dir, name, b + ".summary.json"))
-            if s and s.get("complete"):
-                return name
+        if any(finished(name, b) for b in benches):
+            return name
     return "base_f16" if reg.get("base_f16") else "base"
 
 
@@ -893,44 +935,57 @@ def main():
     a.benchmarks = ",".join(benches)       # so the dashboard shows what is actually being measured
     holder = {"rows": [], "deltas": [], "contam": {}, "plan": []}
 
-    # Which models still need measuring. The base model is measured once and never again - so whichever
-    # name it was first measured under ("base", or "base_f16" once a fine-tune has produced the same weights
-    # at full precision) is the name it keeps. Without this, converting the base to f16 during the first
-    # fine-tune would silently give it a second identity and the base would be benchmarked all over again.
     reg = Registry.load()
     want = [m.strip() for m in a.models.split(",") if m.strip()]
-    if not want:
-        want = [base_id(run_dir, benches, reg)] + [v["id"] for v in reg.get("versions", [])]
-    plan = []
-    for m in want:
-        for b in benches:
-            done = read_json(os.path.join(run_dir, m, b + ".summary.json"))
-            if not done and m in ("base", "base_f16"):
-                other = "base" if m == "base_f16" else "base_f16"
-                done = read_json(os.path.join(run_dir, other, b + ".summary.json"))
-                if done and done.get("complete"):
-                    log("skip", "the base model was already measured on " + b + " as '" + other + "': " +
-                        format(done["pass_rate"], ".1f") + "% pass@1 - it is never re-measured")
-            if done and done.get("complete") and not a.force:
-                if not any(r["model"] == done["model"] and r["bench"] == b for r in holder["rows"]):
-                    holder["rows"].append(done)
-                    if done["model"] == m:
-                        log("skip", m + " on " + b + " was already measured: " +
-                            format(done["pass_rate"], ".1f") + "% pass@1 - not re-running it")
-                continue
-            plan.append((m, b))
-    holder["plan"] = [{"model": m, "bench": b} for m, b in plan]
-
-    if a.report or not plan:
-        rows = sorted(holder["rows"], key=lambda r: (r["bench"], r["model"]))
+    if a.report:
+        names = want or ["base", "base_f16"] + [v["id"] for v in reg.get("versions", [])]
+        rows = sorted((s for m in names for b in benches for s in [read_json(summary_file(run_dir, m, b))] if s),
+                      key=lambda r: (r["bench"], r["model"]))
         if not rows:
             log("report", "no measurements yet for run '" + a.run + "'. Run `python benchmark.py` "
                           "(after `python finetune.py` there will be a version to compare).")
             return
         table(rows)
-        holder["deltas"] = deltas(rows)
-        if not a.report:
-            log("done", "every requested model has already been measured; --force re-runs them", "green")
+        holder["deltas"] = deltas(rows, run_dir)
+        return
+
+    # Which models still need measuring, decided problem by problem: a --limit run answers the first few
+    # problems, and it is neither taken for the whole benchmark nor repeated. The base model is measured in full
+    # once and never again - so whichever name it was first measured under ("base", or "base_f16" once a
+    # fine-tune has produced the same weights at full precision) is the name it keeps. Without this, converting
+    # the base to f16 during the first fine-tune would silently give it a second identity and the base would be
+    # benchmarked all over again.
+    full = {b: load_bench(b, a) for b in benches}           # a cached file after the first run
+    runs = {b: capped(b, full[b], a) for b in benches}
+    answered = lambda m, b, items: sum(os.path.exists(result_file(run_dir, m, b, it["task_id"])) for it in items)
+    finished = lambda m, b: answered(m, b, full[b]) == len(full[b])
+    if not want:
+        want = [base_id(benches, finished, reg)] + [v["id"] for v in reg.get("versions", [])]
+    plan = []
+    for m in want:
+        for b in benches:
+            other = {"base": "base_f16", "base_f16": "base"}.get(m)
+            if other and not a.force and finished(other, b) and not finished(m, b):
+                done = summarize(run_dir, other, b, full[b], contamination(b))
+                why = "the base model was already measured on " + b + " as '" + other + "'"
+                again = "it is never re-measured"
+            elif not a.force and answered(m, b, runs[b]) == len(runs[b]):
+                done = summarize(run_dir, m, b, full[b], contamination(b))
+                why, again = m + " on " + b + " was already measured", "not re-running it"
+            else:
+                plan.append((m, b))
+                continue
+            if done and not any(r["model"] == done["model"] and r["bench"] == b for r in holder["rows"]):
+                holder["rows"].append(done)
+                log("skip", why + ": " + format(done["pass_rate"], ".1f") + "% pass@1 on " + str(done["n"]) +
+                    " of " + str(len(full[b])) + " problems - " + again)
+    holder["plan"] = [{"model": m, "bench": b} for m, b in plan]
+
+    if not plan:
+        rows = sorted(holder["rows"], key=lambda r: (r["bench"], r["model"]))
+        table(rows)
+        holder["deltas"] = deltas(rows, run_dir)
+        log("done", "every requested model has already been measured; --force re-runs them", "green")
         return
 
     Log.block(["", Log.paint("  Recursive self-improvement - phase 3: benchmarking", "bold"),
@@ -952,27 +1007,29 @@ def main():
         Dash(make_api(a, bench_obj, holder), "benchmark").start(a.dash_port, not a.no_browser)
 
     try:
-        data = {}
         contam = {}
         for b in benches:
-            data[b] = load_bench(b, a)
-            log("data", b + ": " + str(len(data[b])) + " problems")
-            contam[b] = screen(backend, data[b], b, a)
-            holder["contam"][b] = {"flagged": sum(1 for v in contam[b].values() if v.get("memorized")),
-                                   "total": len(data[b])}
+            log("data", b + ": " + str(len(full[b])) + " problems" +
+                ("" if len(runs[b]) == len(full[b]) else ", this run the first " + str(len(runs[b]))))
+            contam[b] = screen(backend, runs[b], b, a)
+            holder["contam"][b] = {"flagged": sum(1 for it in runs[b]
+                                                  if (contam[b].get(it["task_id"]) or {}).get("memorized")),
+                                   "total": len(runs[b])}
         for model_id in dict.fromkeys(m for m, _ in plan):
             if Stop.is_set():
                 break
             entry = Registry.resolve(model_id) or (reg.get("base_f16") if model_id == "base_f16" else None)
             if not entry or not entry.get("gguf"):
-                log("warn", "no weights registered for " + model_id + "; skipping", "yellow")
+                log("warn", model_id + (" has no GGUF: its conversion at the end of fine-tuning did not finish, "
+                                        "and running finetune again converts it" if entry else
+                                        " is not a registered model") + " - skipping it", "yellow")
                 continue
             backend.serve("gen", entry)
             log("model", "measuring " + model_id + " (" + os.path.basename(entry["gguf"]) + ")", "bold")
             for m, b in plan:
                 if m != model_id or Stop.is_set():
                     continue
-                summ = bench_obj.run_model(model_id, b, data[b], contam[b])
+                summ = bench_obj.run_model(model_id, b, runs[b], full[b], contam[b])
                 if summ:
                     holder["rows"] = [r for r in holder["rows"]
                                       if not (r["model"] == m and r["bench"] == b)] + [summ]
@@ -987,7 +1044,7 @@ def main():
     finally:
         rows = sorted(holder["rows"], key=lambda r: (r["bench"], r["model"]))
         table(rows)
-        holder["deltas"] = deltas(rows)
+        holder["deltas"] = deltas(rows, run_dir)
         write_json(os.path.join(run_dir, "comparison.json"),
                    {"rows": rows, "deltas": holder["deltas"], "contamination": holder["contam"],
                     "when": time.time(), "config": {k: v for k, v in vars(a).items()}})

@@ -216,6 +216,9 @@ checkpoint. On a Mac every run starts from the configured length again, because 
 running out after training for a while restarts with the same settings, and so does a GPU fault such as
 "Discarded (victim of GPU error/recovery)", for as long as the restarts keep saving checkpoints.
 The base model is also converted to GGUF at the same precision, so the benchmark compares like with like.
+The conversion uses llama.cpp's converter - the script, its `conversion` package and its `gguf-py`, taken
+together from one source archive - and writes its output to `logs/gguf.log`. If it fails, the version is not
+registered, because nothing can load it; re-running converts it without training again.
 
 Seven phases - `dataset, deps, base weights, train, merge, gguf, register` - each recorded as it completes.
 
@@ -283,10 +286,14 @@ has **not** memorised. That second column is the one to read.
 harness; a problem whose official solution does not pass here is dropped rather than counted as a model
 failure. LBPP: 161 of 162. EvoEval: 199 of 200.
 
-**The base model is measured once and never again.** Later runs only measure versions that have no results
-yet (`--force` re-measures). The base keeps whichever identity it was first measured under, so converting it
-to f16 during the first fine-tune - which is what makes the comparison like-for-like - cannot give it a
-second identity and quietly earn it a second benchmark run.
+**The base model is measured once and never again.** Later runs only measure what has no results yet
+(`--force` measures again). The base keeps whichever identity it was first measured under in full, so
+converting it to f16 during the first fine-tune - which is what makes the comparison like-for-like - cannot
+give it a second identity and quietly earn it a second benchmark run.
+
+**`--limit N` is a quick look, not a result.** It answers the first N problems of each benchmark and marks the
+scores partial; the next run without it answers only the rest. Each version is compared with the base on the
+problems both have answered, so a partial score is never set against a full one.
 
 ## Why Python
 
