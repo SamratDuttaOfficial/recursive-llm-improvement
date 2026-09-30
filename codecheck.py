@@ -19,6 +19,10 @@ from common import Venv, log
 
 FENCE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.S)
 BUILTINS = set(dir(builtins))
+# The model's code is parsed here thousands of times, and from Python 3.12 every "\d" in a plain string of it prints
+# a SyntaxWarning on the console, where it reads like a fault in this program. Code compiled from a string - whose
+# "module" is <unknown>, <answer> and the like - no longer warns; ruff reports the same thing as a finding (W605).
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="<")
 RUFF_RULES = "E,F,W,B,C4,UP,SIM,RET,ARG,PIE"
 # W291-W293 are about trailing whitespace at the end of the extracted block, which is an artifact of pulling
 # the code out of a fenced answer rather than anything the model did wrong.
