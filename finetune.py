@@ -102,9 +102,12 @@ def answer_key(it):
 
 def verify(items, a, out_dir):
     """correctness() for every answer, several at a time. The verdicts are kept in out_dir/verdicts.json as they
-    come in, so a stopped run does not check the same answers twice. Returns {answer_key: reason or None}."""
+    come in, so a stopped run does not check the same answers twice - unless the checker has changed since, when
+    they are all checked again. Returns {answer_key: reason or None}."""
     path = os.path.join(out_dir, "verdicts.json")
-    cache = read_json(path, {}) or {}
+    kept = read_json(path, {}) or {}
+    cache = kept.get("verdicts", {}) if kept.get("checker") == codecheck.VERSION else {}
+    save = lambda: write_json(path, {"checker": codecheck.VERSION, "verdicts": cache})
     todo = list({answer_key(it): it for it in items if answer_key(it) not in cache}.items())
     if todo:
         phase("dataset", "checking which answers are correct")
@@ -123,14 +126,14 @@ def verify(items, a, out_dir):
                     cache[futs[f]] = "check failed (" + type(e).__name__ + ")"
                 done += 1
                 if done % 100 == 0:
-                    write_json(path, cache)
+                    save()
                     log("dataset", "  " + str(done) + "/" + str(len(todo)) + " checked, eta " +
                         fmt_t((time.time() - t0) / done * (len(todo) - done)))
         finally:
             for f in futs:
                 f.cancel()
             pool.shutdown(wait=not Stop.is_set())
-            write_json(path, cache)
+            save()
     return {k: (v or None) for k, v in cache.items()}
 
 
@@ -271,7 +274,8 @@ def build_dataset(a, out_dir):
     stats = {"examples": len(rows), "rounds": per_round, "hosts": hosts, "sources": len(files),
              "chars": sum(r["chars"] for r in rows),
              "avg_chars": round(sum(r["chars"] for r in rows) / len(rows)), "fingerprint": fingerprint,
-             "only_correct": bool(a.only_correct), "left_out": dropped}
+             "only_correct": bool(a.only_correct), "left_out": dropped,
+             "checker": codecheck.VERSION if a.only_correct else None}
     named = [h for h in hosts if h != "?"]      # a corpus written before `host` existed reports as "?"
     note = ([("across " + str(len(named)) + " machines")] if len(named) > 1 else []) + \
            ([(str(hosts["?"]) + " with no machine stamp")] if hosts.get("?") and named else [])
@@ -861,15 +865,17 @@ def main():
         # ---- 1. dataset
         phase("dataset", "collecting the corpus answers")
         data = os.path.join(out_dir, "dataset.jsonl")
-        # A training set built with the other setting, or before there was one, is built again while training has
-        # not finished - the worker then starts over, since its data changed. A finished training keeps its own.
-        stale = bool(prog.get("dataset")) and not prog.get("train_done") and \
-            prog["dataset"].get("only_correct") != bool(a.only_correct)
+        # A training set built with the other setting, before there was one, or by an older checker is built again
+        # while training has not finished - the worker then starts over, since its data changed. A finished
+        # training keeps its own.
+        built = prog.get("dataset") or {}
+        why = ("before only the correct answers could be chosen" if "only_correct" not in built else
+               "with the other --only-correct setting" if built["only_correct"] != bool(a.only_correct) else
+               "by an older checker, which took correct code for wrong" if a.only_correct and
+               built.get("checker") != codecheck.VERSION else "")
+        stale = bool(built) and not prog.get("train_done") and bool(why)
         if stale:
-            log("dataset", "the training set was built " + ("before only the correct answers could be chosen"
-                                                            if "only_correct" not in prog["dataset"] else
-                                                            "with the other --only-correct setting") +
-                "; building it again")
+            log("dataset", "the training set was built " + why + "; building it again")
         if not prog.get("dataset") or not os.path.exists(data) or stale:
             data, stats = build_dataset(a, out_dir)
             check_duplicate(a, vid, parent, stats)

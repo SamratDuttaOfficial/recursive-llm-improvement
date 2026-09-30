@@ -23,7 +23,13 @@ RUFF_RULES = "E,F,W,B,C4,UP,SIM,RET,ARG,PIE"
 # W291-W293 are about trailing whitespace at the end of the extracted block, which is an artifact of pulling
 # the code out of a fenced answer rather than anything the model did wrong.
 RUFF_IGNORE = "W291,W292,W293"
+# The ruff findings that are errors - the code is wrong, not merely untidy: syntax, undefined names, and the
+# pyflakes checks for statements that cannot do what they say (a repeated dict key, an assert on a tuple, `is`
+# against a literal, break outside a loop). An unused variable or a redefinition is a warning.
+RUFF_ERRORS = ("E9", "F6", "F7", "F821", "F822", "F823")
 _RUFF = {"checked": False, "ok": False}
+# Bumped whenever the verdict on the same code could change, so anything that kept verdicts checks again.
+VERSION = 2
 
 # What each kind of finding costs, and what a well-formed answer earns back. `config.bind_checker` replaces
 # these with the "checker" block of config.json, so the scoring can be retuned without touching this file.
@@ -175,7 +181,7 @@ def ruff_lint(code, timeout=60):
         rule = it.get("code") or "RUFF"
         out.append({"tool": "ruff", "rule": rule, "line": loc.get("row", 0), "col": loc.get("column", 0),
                     "msg": it.get("message", ""),
-                    "severity": "error" if rule.startswith(("E9", "F8", "F6", "F7")) else "warning"})
+                    "severity": "error" if rule.startswith(RUFF_ERRORS) else "warning"})
     return out
 
 
@@ -185,7 +191,7 @@ class _Scan(ast.NodeVisitor):
 
     def __init__(s):
         s.imported, s.used, s.bound, s.problems = {}, set(), set(BUILTINS), []
-        s.funcs, s.classes, s.has_main, s.depth = [], [], False, 0
+        s.funcs, s.classes, s.has_main, s.depth, s.star = [], [], False, 0, False
 
     def add(s, node, rule, msg, severity="warning"):
         s.problems.append({"tool": "ast", "rule": rule, "line": getattr(node, "lineno", 0),
@@ -202,6 +208,7 @@ class _Scan(ast.NodeVisitor):
         for a in n.names:
             if a.name == "*":
                 s.add(n, "star-import", "`from " + str(n.module) + " import *` hides what the code depends on")
+                s.star = True               # whatever it brought in is bound, and nothing here can know what
                 continue
             name = a.asname or a.name
             s.imported[name] = n.lineno
@@ -223,20 +230,23 @@ class _Scan(ast.NodeVisitor):
             s.used.add(node.id)
         s.generic_visit(n)
 
+    def _bind_args(s, args):
+        for a in list(args.args) + list(args.kwonlyargs) + list(args.posonlyargs):
+            s.bound.add(a.arg)
+        if args.vararg:
+            s.bound.add(args.vararg.arg)
+        if args.kwarg:
+            s.bound.add(args.kwarg.arg)
+
     def _func(s, n):
         s.bound.add(n.name)
         if s.depth == 0:
             s.funcs.append(n.name)
-        for a in list(n.args.args) + list(n.args.kwonlyargs) + list(n.args.posonlyargs):
-            s.bound.add(a.arg)
-        if n.args.vararg:
-            s.bound.add(n.args.vararg.arg)
-        if n.args.kwarg:
-            s.bound.add(n.args.kwarg.arg)
+        s._bind_args(n.args)
         for d in list(n.args.defaults) + [x for x in n.args.kw_defaults if x]:
             if isinstance(d, (ast.List, ast.Dict, ast.Set)):
                 s.add(d, "mutable-default", "mutable default argument in `" + n.name +
-                      "`: it is shared between every call", "error")
+                      "`: it is shared between every call")
         if s.depth == 0 and not n.name.startswith("_") and not ast.get_docstring(n):
             s.add(n, "no-docstring", "public function `" + n.name + "` has no docstring", "info")
         s.depth += 1
@@ -244,6 +254,30 @@ class _Scan(ast.NodeVisitor):
         s.depth -= 1
 
     visit_FunctionDef = visit_AsyncFunctionDef = _func
+
+    # Names that are bound without an ast.Name to show it: a lambda's parameters, `except ... as e`, the captures
+    # of a match statement and type parameters. Missing these made correct code read as using undefined names.
+    def visit_Lambda(s, n):
+        s._bind_args(n.args)
+        s.generic_visit(n)
+
+    def visit_MatchAs(s, n):
+        if n.name:
+            s.bound.add(n.name)
+        s.generic_visit(n)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(s, n):
+        if n.rest:
+            s.bound.add(n.rest)
+        s.generic_visit(n)
+
+    def visit_TypeVar(s, n):
+        s.bound.add(n.name)
+        s.generic_visit(n)
+
+    visit_ParamSpec = visit_TypeVarTuple = visit_TypeVar
 
     def visit_ClassDef(s, n):
         s.bound.add(n.name)
@@ -256,6 +290,8 @@ class _Scan(ast.NodeVisitor):
         s.depth -= 1
 
     def visit_ExceptHandler(s, n):
+        if n.name:
+            s.bound.add(n.name)
         if n.type is None:
             s.add(n, "bare-except", "bare `except:` also swallows KeyboardInterrupt and SystemExit")
         elif isinstance(n.type, ast.Name) and n.type.id == "Exception" and \
@@ -293,7 +329,7 @@ def ast_lint(code):
         if name not in sc.used:
             problems.append({"tool": "ast", "rule": "unused-import", "line": line, "col": 0,
                              "msg": "`" + name + "` is imported but never used", "severity": "warning"})
-    unknown = sorted(n for n in sc.used - sc.bound if not n.startswith("__"))
+    unknown = [] if sc.star else sorted(n for n in sc.used - sc.bound if not n.startswith("__"))
     for n in unknown[:12]:
         problems.append({"tool": "ast", "rule": "undefined-name", "line": 0, "col": 0,
                          "msg": "`" + n + "` is used but never defined or imported", "severity": "error"})
@@ -353,7 +389,9 @@ if out["import_ok"]:
     if os.path.exists("examples.py"):
         try:
             buf3 = io.StringIO(); sys.stdout = buf3
-            exec(compile(open("examples.py", encoding="utf-8").read(), "examples.py", "exec"), dict(g))
+            # run as the main program, so asserts written under `if __name__ == "__main__":` run too
+            exec(compile(open("examples.py", encoding="utf-8").read(), "examples.py", "exec"),
+                 dict(g, __name__="__main__"))
             sys.stdout = real
             out["examples"] = {"ok": True}
         except BaseException:
