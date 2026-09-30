@@ -96,8 +96,17 @@ answers, while **the judges always stay on the untouched base model**, so the ya
 Or run the whole cycle in one go:
 
 ```bash
-python pipeline.py --cycles 2
+python pipeline.py --rounds 85
 ```
+
+`--rounds` is how many rounds of exercises each cycle writes before it trains. Without it `corpus.rounds`
+decides, and its default of 0 means the corpus stage goes on until Ctrl-C. `--cycles 3` runs three cycles,
+each answered by the version the one before it made. **Stopped anywhere, the same command carries on from
+there.** Stopped mid-corpus, it writes only the rounds still missing, up to the same round number and with the
+same model. Stopped in training, it continues from the last checkpoint. Stopped in the benchmark, it goes on
+with the problems not yet answered. Only once every cycle asked for is finished does the same command start a
+new one. `--new-cycle` starts one straight away, and `--from-stage finetune` moves on without finishing the
+corpus.
 
 ## Phase 1 - building the corpus (`run.py`)
 
@@ -405,7 +414,8 @@ Every flag below has a home in `config.json`; passing it overrides the file for 
 scripts also take `--config PATH`, `--print-config` and `--init-config`.
 
 **`run.py`** `--generator base|latest|v2` who answers (judges stay on base) - `--questions 24` per round -
-`--rounds 3` rounds in one go, 0 (the default) means until Ctrl-C - `--new` / `--no-new` - `--workers N` -
+`--rounds 3` rounds in one go, 0 (the default) means until Ctrl-C - `--until-round N` stop once round N is
+done, however many runs that takes - `--new` / `--no-new` - `--workers N` -
 `--slots N` -
 `--answer-tokens 20000` the ceiling for one answer - `--judge-weight 0.7` judges against checker -
 `--question-batch 6` exercises per generation call - `--question-temp 1.25` / `--question-top-k 120` /
@@ -421,8 +431,9 @@ stack on a version - `--version v4` name it - `--epochs`, `--lr`, `--rank`, `--s
 `--splits evoeval=subtle,creative` - `--limit N` - `--no-probe` skip the contamination screen -
 `--no-self-check` - `--force` re-measure - `--report` print and exit
 
-**`pipeline.py`** `--cycles N` - `--stack` chain versions instead of retraining from base -
-`--from-stage corpus|finetune|benchmark` - `--skip finetune`
+**`pipeline.py`** `--rounds N` rounds of exercises per cycle - `--cycles N` - `--stack` chain versions
+instead of retraining from base - `--from-stage corpus|finetune|benchmark` - `--new-cycle` leave an
+unfinished cycle and start a new one - `--skip finetune`
 
 ## Requirements
 

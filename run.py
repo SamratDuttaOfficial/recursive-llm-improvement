@@ -709,6 +709,8 @@ def decide_round(r, args):
             return last, False
     if args.no_new and nums:
         return None, False
+    if getattr(args, "until_round", 0) and nums and nums[-1] >= args.until_round:
+        return None, False
     return (nums[-1] + 1 if nums else 1), True
 
 
@@ -732,6 +734,9 @@ def main():
     ap.add_argument("--no-new", action="store_true", help="finish only what is already pending, then stop")
     ap.add_argument("--rounds", type=int, default=O,
                     help="how many rounds to run in one go; 0 (the default) keeps going until Ctrl-C")
+    ap.add_argument("--until-round", type=int, default=0,
+                    help="stop once round N is written and answered, however many runs that takes - what "
+                         "pipeline.py uses, so that a cycle resumed after Ctrl-C writes only the rounds missing")
     ap.add_argument("--workers", type=int, default=O, help="exercises in flight; 0 = fit to the GPU slots")
     ap.add_argument("--slots", type=int, default=O, help="llama-server parallel slots; 0 = fit to free VRAM")
     ap.add_argument("--backend", default=O, choices=["auto", "llama", "ollama"])
@@ -803,8 +808,12 @@ def main():
     banner(a, r)
     n_round, is_new = decide_round(r, a)
     if n_round is None:
-        log("done", "nothing to do: every round is finished. `--new` starts another set, "
-                    "`python finetune.py` trains on what is there.", "green")
+        if a.until_round:
+            log("done", "round " + str(a.until_round) + " is written and answered, which is as far as "
+                        "--until-round goes", "green")
+        else:
+            log("done", "nothing to do: every round is finished. `--new` starts another set, "
+                        "`python finetune.py` trains on what is there.", "green")
         return
 
     # ---- backend: the generator (maybe fine-tuned) and the judges (always the base model)
@@ -850,6 +859,8 @@ def main():
                 break
             made += 1
             if a.rounds and made >= a.rounds:
+                break
+            if a.until_round and n_round >= a.until_round:
                 break
     except Interrupted:
         pass
@@ -968,7 +979,8 @@ def banner(a, r):
              " per slot (every answer in full, never truncated)",
              "  checker    compile + AST + ruff" + ("" if not a.no_exec else " (execution off)") +
              ", scoring only - no answer is filtered out",
-             "  loop       " + (str(a.rounds) + " round(s) and then stop" if a.rounds else
+             "  loop       " + ("until round " + str(a.until_round) + " is done" if a.until_round else
+                                str(a.rounds) + " round(s) and then stop" if a.rounds else
                                 "a new set of exercises after every finished round, until Ctrl-C"),
              "  machine    " + (g["name"] + " " + str(g["total"]) + " MB " +
                                 ("unified" if g.get("unified") else "VRAM") if g else "no GPU detected"),
