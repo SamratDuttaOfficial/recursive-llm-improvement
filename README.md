@@ -206,12 +206,15 @@ into the base weights and converted to GGUF so the next round can be served by t
   vocabulary in slices; every layer is checkpointed. MLX is held to the memory that is actually free - by
   default it sizes itself by the GPU working set, about 3/4 of RAM - and a few real steps are measured first, so
   training runs at the longest sequence that fits and the log says what it measured. It resumes at the exact
-  example it had reached. The adapter is merged into the original Hugging Face files rather than with
-  `mlx_lm fuse`, whose output is in MLX's layout and cannot be converted to GGUF.
+  example it had reached, with AdamW's state (bias-corrected, as PyTorch's is) saved alongside the adapter. The
+  adapter is merged into the original Hugging Face files rather than with `mlx_lm fuse`, whose output is in
+  MLX's layout and cannot be converted to GGUF.
 
 The right stack is installed automatically for whichever machine you are on. Out of memory is not a failure:
 the sequence length halves, then (PyTorch only) the base drops to 4-bit, and training restarts from the last
-checkpoint.
+checkpoint. On a Mac every run starts from the configured length again, because the worker measures what fits;
+running out after training for a while restarts with the same settings, and so does a GPU fault such as
+"Discarded (victim of GPU error/recovery)", for as long as the restarts keep saving checkpoints.
 The base model is also converted to GGUF at the same precision, so the benchmark compares like with like.
 
 Seven phases - `dataset, deps, base weights, train, merge, gguf, register` - each recorded as it completes.

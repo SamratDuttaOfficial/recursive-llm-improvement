@@ -28,6 +28,11 @@ LIVE_TRAIN = {"steps": [], "state": {}, "log": []}
 # How running out of memory reads from PyTorch (CUDA, MPS) and from MLX, whose Metal driver says "Insufficient
 # Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)".
 OOM = re.compile(r"out of memory|outofmemory|insufficient memory|metal::malloc", re.I)
+# Metal dropping the work for any other reason: "Discarded (victim of GPU error/recovery)" when the GPU resets
+# over something anywhere on the Mac, timeouts, hangs. The settings are not at fault, so the same ones go again
+# from the last checkpoint.
+GPU_FAULT = re.compile(r"command buffer execution failed|kIOGPUCommandBufferCallbackError|GPU error/recovery", re.I)
+RETRIES = 3         # failed attempts in a row with no new checkpoint between them, and training gives up
 
 # Which config key backs each flag. A flag the user actually passes wins; anything else comes from the file.
 CONFIG_MAP = {
@@ -302,20 +307,27 @@ def fetch_base_hf(a):
 # ---------------------------------------------------------------- training
 def run_training(a, base_hf, data, out_dir, prog, save):
     """Start train_worker.py in the venv and follow its PROGRESS lines. Ctrl-C stops it and keeps the last
-    checkpoint, so the next run continues from there. An out-of-memory failure retries with smaller settings."""
+    checkpoint, so the next run continues from there. A failure restarts it from that checkpoint: with smaller
+    settings after running out of memory, with the same ones after a GPU fault - for as long as the attempts
+    keep saving checkpoints, and RETRIES times in a row when they do not."""
     ladder = [{"seq_len": a.seq_len, "batch": a.batch, "load_4bit": a.load_4bit},
               {"seq_len": max(512, a.seq_len // 2), "batch": 1, "load_4bit": a.load_4bit},
               {"seq_len": max(512, a.seq_len // 2), "batch": 1, "load_4bit": True}]
-    if prog.get("backend") == "mlx":
+    mlx = prog.get("backend") == "mlx"
+    if mlx:
         ladder = ladder[:2]     # MLX training has no 4-bit mode, so a third rung would repeat the second
-    start = min(prog.get("train_attempt", 0), len(ladder) - 1)
-    for attempt in range(start, len(ladder)):
+    # The MLX worker measures what fits in the memory free when it starts and shortens the sequences itself, so
+    # each run starts from the configured length; PyTorch starts from the settings that last worked.
+    attempt = 0 if mlx else min(prog.get("train_attempt", 0), len(ladder) - 1)
+    runs = stalled = 0
+    while True:
         if Stop.is_set():
             raise Interrupted()
         cfg = ladder[attempt]
         prog["train_attempt"] = attempt
         prog["train_cfg"] = cfg
         save()
+        runs += 1
         args = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_worker.py"),
                 "--base", base_hf, "--data", data, "--out", out_dir,
                 "--epochs", str(a.epochs), "--batch", str(cfg["batch"]), "--accum", str(a.accum),
@@ -323,17 +335,20 @@ def run_training(a, base_hf, data, out_dir, prog, save):
                 "--alpha", str(a.alpha), "--save-steps", str(a.save_steps), "--merge"]
         if cfg["load_4bit"]:
             args.append("--load-4bit")
-        log("train", "starting" + (" (attempt " + str(attempt + 1) + ")" if attempt else "") +
+        log("train", ("starting" if runs == 1 else "restarting from the last checkpoint") +
+            (" (attempt " + str(attempt + 1) + ")" if attempt else "") +
             ": seq " + str(cfg["seq_len"]) + ", batch " + str(cfg["batch"]) + " x accum " + str(a.accum) +
             ", lr " + str(a.lr) + ", rank " + str(a.rank) + (", 4-bit base" if cfg["load_4bit"] else ""), "bold")
         logf = open(os.path.join(LOGS, "train.log"), "a", encoding="utf-8")
-        logf.write("\n===== " + time.strftime("%Y-%m-%d %H:%M:%S") + " attempt " + str(attempt + 1) + " =====\n")
+        logf.write("\n===== " + time.strftime("%Y-%m-%d %H:%M:%S") + " attempt " + str(attempt + 1) +
+                   (", run " + str(runs) if runs > 1 else "") + " =====\n")
         kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {"start_new_session": True}
         p = subprocess.Popen([Venv.python()] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, bufsize=1, errors="replace", **kw)
         from common import kill_tree
         Stop.on_exit(lambda: kill_tree(p))
-        oom, t_last, t0 = False, time.time(), time.time()
+        oom = fault = False
+        t_last, clock, before = time.time(), {}, prog.get("last_checkpoint")
         for line in p.stdout:
             logf.write(line)
             line = line.rstrip()
@@ -342,9 +357,11 @@ def run_training(a, base_hf, data, out_dir, prog, save):
                 break
             if OOM.search(line):        # raw or inside a PROGRESS event: the worker reports errors both ways
                 oom = True
+            elif GPU_FAULT.search(line):
+                fault = True
             if line.startswith("PROGRESS "):
                 ev = json.loads(line[9:])
-                handle_progress(ev, prog, save, t0)
+                handle_progress(ev, prog, save, clock)
             else:
                 LIVE_TRAIN["log"].append(line[:300])
                 del LIVE_TRAIN["log"][:-200]
@@ -359,15 +376,26 @@ def run_training(a, base_hf, data, out_dir, prog, save):
             prog["train_done"] = True
             save()
             return True
-        if oom and attempt + 1 < len(ladder):
+        progress = prog.get("last_checkpoint") != before
+        stalled = 0 if progress else stalled + 1
+        if oom and mlx and progress:
+            again = "out of memory, after training for a while: less is free now than when it started"
+        elif oom and attempt + 1 < len(ladder):
             log("warn", "out of memory - retrying with smaller settings", "yellow")
+            attempt += 1
             continue
-        why = ", out of memory at seq " + str(cfg["seq_len"]) if oom else ""
-        sys.exit("training failed (exit " + str(rc) + why + "); the full output is in logs/train.log")
-    return False
+        elif fault and not oom and stalled < RETRIES:
+            again = "the GPU dropped the training's work (a GPU reset or fault, not memory)"
+        else:
+            why = (", out of memory at seq " + str(cfg["seq_len"]) if oom else
+                   ", " + str(stalled) + " GPU faults in a row with no checkpoint between them" if fault else "")
+            sys.exit("training failed (exit " + str(rc) + why + "); the full output is in logs/train.log")
+        log("warn", again + " - restarting from the last checkpoint in 30 s", "yellow")
+        if Stop.winding_down() or Stop.sleep(30):
+            raise Interrupted()
 
 
-def handle_progress(ev, prog, save, t0):
+def handle_progress(ev, prog, save, clock):
     kind = ev.get("kind")
     if kind == "step":
         LIVE_TRAIN["steps"].append({"step": ev.get("step"), "loss": ev.get("loss"),
@@ -377,12 +405,14 @@ def handle_progress(ev, prog, save, t0):
                                    loss=ev.get("loss"), epoch=ev.get("epoch"))
         prog["step"], prog["max_steps"] = ev.get("step"), ev.get("max_steps")
         st, mx = ev.get("step") or 0, ev.get("max_steps") or 0
+        if "step" not in clock:         # this run's first step: a resumed run starts part-way through
+            clock.update(step=st, t=time.time())
         if st and st % 10 == 0:
-            el = time.time() - t0
-            eta = el / st * (mx - st) if mx and st else 0
+            done, el = st - clock["step"], time.time() - clock["t"]
             log("train", "step " + str(st) + "/" + str(mx) + "  loss " +
                 (format(ev["loss"], ".4f") if ev.get("loss") is not None else "-") +
-                "  epoch " + str(ev.get("epoch", "?")) + "  eta " + fmt_t(eta) +
+                "  epoch " + str(ev.get("epoch", "?")) +
+                "  eta " + (fmt_t(el / done * (mx - st)) if mx and done > 0 else "?") +
                 ("  peak mem " + format(ev["peak_gb"], ".1f") + " GB" if ev.get("peak_gb") else ""))
             save()
     elif kind == "val":

@@ -228,27 +228,40 @@ def _checkpointed(ops):
 
 def _disagreement(ops, candidate):
     """Worst relative difference between `candidate` and mlx-lm's loop, over both results and the gradients of
-    all six inputs, on a problem with padding, repeated key heads, a starting state and decays close to zero."""
+    all six inputs, on a problem with padding, repeated key heads, a starting state and decays close to zero.
+    Returns (the difference, which result or gradient it is in).
+
+    The decay goes in as its logarithm, the way the model makes it (g = exp(-A softplus(a + dt))), so the
+    gradient compared is g dL/dg, which is what reaches the weights. dL/dg by itself is float32 rounding divided
+    by g wherever g is tiny, in anything that does not run token by token: at g = 1e-11 it failed this check
+    for a chunked recurrence that agrees to 1e-6 in every quantity training uses."""
     B, T, Hk, Hv, Dk, Dv = 2, 150, 2, 4, 32, 16
     mx.random.seed(7)
     unit = lambda x: x / mx.sqrt((x * x).sum(-1, keepdims=True))      # the model L2-normalises q and k
     args = (unit(mx.random.normal((B, T, Hk, Dk))) * Dk ** -0.5, unit(mx.random.normal((B, T, Hk, Dk))),
-            mx.random.normal((B, T, Hv, Dv)), mx.exp(-mx.exp(mx.random.normal((B, T, Hv)))),
+            mx.random.normal((B, T, Hv, Dv)), -mx.exp(mx.random.normal((B, T, Hv))),
             mx.sigmoid(mx.random.normal((B, T, Hv))), 0.1 * mx.random.normal((B, Hv, Dv, Dk)))
     wy, ws = mx.random.normal((B, T, Hv, Dv)), mx.random.normal((B, Hv, Dv, Dk))
 
+    def through_log(fn):
+        return lambda q, k, v, log_g, beta, state: fn(q, k, v, mx.exp(log_g), beta, state)
+
     def loss(fn):
         def f(*x):
-            y, s = fn(*x)
+            y, s = through_log(fn)(*x)
             return (y * wy).sum() + (s * ws).sum()
         return f
 
     def diff(a, b):
-        return (mx.abs(a - b).max() / (mx.abs(a).max() + 1e-6)).item()
+        d = (mx.abs(a - b).max() / (mx.abs(a).max() + 1e-6)).item()
+        return d if d == d else float("inf")        # NaN is as far off as it gets
 
-    worst = [diff(a, b) for a, b in zip(ops(*args), candidate(*args))]
+    found = dict(zip(("y", "state"), (diff(a, b) for a, b in zip(through_log(ops)(*args),
+                                                                 through_log(candidate)(*args)))))
     grads = [mx.grad(loss(fn), argnums=list(range(6)))(*args) for fn in (ops, candidate)]
-    return max(worst + [diff(a, b) for a, b in zip(*grads)])
+    found.update(zip(("dq", "dk", "dv", "dlog g", "dbeta", "dstate"), (diff(a, b) for a, b in zip(*grads))))
+    worst = max(found, key=found.get)
+    return found[worst], worst
 
 
 def install_recurrence():
@@ -262,10 +275,10 @@ def install_recurrence():
         return "mlx-lm's own loop (there is no gated_delta_ops to replace: " + type(e).__name__ + ")"
     fallback, chunked = _checkpointed(ops), False
     try:
-        err = _disagreement(ops, chunked_gated_delta)
+        err, where = _disagreement(ops, chunked_gated_delta)
         chunked = err < 1e-3
         how = ("chunked, agrees with mlx-lm to " + format(err, ".0e") if chunked else
-               "chunked disagreed with mlx-lm (" + format(err, ".1e") + ")")
+               "chunked disagreed with mlx-lm in " + where + " (" + format(err, ".1e") + ")")
     except Exception as e:
         how = "chunked could not be checked (" + repr(e)[:160] + ")"
 
@@ -436,6 +449,20 @@ def _lr_schedule(lr, updates, done):
     return at
 
 
+def _saved_moments(path, trainable):
+    """AdamW's moments as the last checkpoint saved them, as a tree for the optimizer's state. None when there are
+    none, or they are not exactly an m and a v for each trainable parameter, in its shape."""
+    from mlx.utils import tree_unflatten
+    try:
+        flat = mx.load(path)
+    except Exception:
+        return None
+    want = {k + "." + m: tuple(v.shape) for k, v in trainable for m in ("m", "v")}
+    if {k: tuple(v.shape) for k, v in flat.items()} != want:
+        return None
+    return tree_unflatten(list(flat.items()))
+
+
 def _num(x):
     """A float out of whatever mlx-lm reports (a Python number or a 0-d array); None when it is absent."""
     try:
@@ -578,17 +605,42 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
         emit("warn", msg=str(cut) + " of " + str(len(enc)) + " training examples are longer than " + str(max_len) +
                          " tokens; the rest of each is not trained on")
     per_update = max(1, a.batch) * max(1, a.accum)
-    opt = optim.AdamW(learning_rate=_lr_schedule(a.lr, math.ceil(goal / per_update), seen // per_update),
-                      weight_decay=0.01)
+    moments = os.path.join(adapter, "resume_optimizer.safetensors")
+    state = _saved_moments(moments, trainable) if seen and prog.get("updates") else None
+    updates = int(prog["updates"]) if state else 0          # how many updates the saved moments have seen
+    schedule = _lr_schedule(a.lr, math.ceil(goal / per_update), max(0, seen // per_update - updates))
+    try:        # bias-corrected, like PyTorch's AdamW that the recipe comes from; MLX leaves it off by default
+        opt = optim.AdamW(learning_rate=schedule, weight_decay=0.01, bias_correction=True)
+    except TypeError:
+        opt = optim.AdamW(learning_rate=schedule, weight_decay=0.01)
+        emit("warn", msg="this MLX's AdamW has no bias correction, so its early updates are larger than PyTorch's")
+    if state:
+        state["step"] = mx.array(updates, dtype=mx.uint64)
+        state["learning_rate"] = opt.state["learning_rate"]
+        opt.state = state
     emit("setup", device="mlx", steps=goal, gpu="Apple silicon (unified memory)", recurrence=how,
          loss=loss_how, max_len=max_len)
     if seen:
-        emit("resume", checkpoint="resume.safetensors, " + str(seen) + " of " + str(goal) + " examples done")
+        emit("resume", checkpoint="resume.safetensors, " + str(seen) + " of " + str(goal) + " examples done, " +
+                                  ("with AdamW's state saved alongside" if state else
+                                   "AdamW starting afresh (no state was saved with it)"))
 
-    def save(path):
+    def save(path, arrays):
         tmp = path[:-len(".safetensors")] + ".partial.safetensors"    # MLX insists on the extension
-        mx.save_safetensors(tmp, dict(tree_flatten(model.trainable_parameters())))
+        mx.save_safetensors(tmp, arrays)
         os.replace(tmp, path)
+
+    def checkpoint(done):
+        """What a resumed run needs to carry on as if it had never stopped: AdamW's moments and how many updates
+        they have seen, the adapter, and how far through the data training is. The position is written last,
+        so it never points past the files it goes with."""
+        m = {k: v for k, v in tree_flatten(opt.state) if k.endswith((".m", ".v"))}
+        if m:
+            save(moments, m)
+        save(keep, dict(tree_flatten(model.trainable_parameters())))
+        _write_json(os.path.join(adapter, "progress.json"),
+                    {"recipe": recipe, "seen": done, "goal": goal, "max_len": max_len,
+                     "updates": int(opt.state["step"].item()) if m else 0})
 
     def validate(step):
         model.eval()
@@ -626,21 +678,20 @@ def _train_mlx(a, train, valid, adapter, lora_params, recipe, goal, prog):
              tokens=len(ids) - 1, peak_gb=peak, active_gb=active, cache_gb=cached,
              grad_norm=None if norm is None else round(_num(norm), 4), epoch=round((i + 1) / len(enc), 3))
         if (i + 1) % max(1, a.save_steps) == 0 and i + 1 < goal:
-            save(keep)
-            _write_json(os.path.join(adapter, "progress.json"),
-                        {"recipe": recipe, "seen": i + 1, "goal": goal, "max_len": max_len})
+            checkpoint(i + 1)
             emit("checkpoint", step=i + 1)
         if (i + 1) % every == 0 or i + 1 == goal:
             validate(i + 1)
 
-    save(os.path.join(adapter, "adapters.safetensors"))
+    save(os.path.join(adapter, "adapters.safetensors"), dict(tree_flatten(model.trainable_parameters())))
     _write_json(os.path.join(adapter, "adapter_config.json"),
                 {"fine_tune_type": "lora", "num_layers": len(model.layers), "lora_parameters": lora_params,
                  "model": a.base})
     _write_json(os.path.join(adapter, "progress.json"),
                 {"recipe": recipe, "seen": goal, "goal": goal, "max_len": max_len, "finished": True})
-    if os.path.exists(keep):
-        os.remove(keep)
+    for path in (keep, moments):
+        if os.path.exists(path):
+            os.remove(path)
     emit("trained", adapter=adapter, replaced_recurrence_calls=CHUNK_CALLS[0])
 
 
