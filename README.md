@@ -316,8 +316,11 @@ three judges, concurrently - so the batch stays full.
 - **Apple silicon** - Metal, with the budget taken as 70% of unified RAM and free memory from `vm_stat`;
   training uses MLX on the same unified memory.
 
-If `llama-server` cannot be used at all, everything falls back to Ollama's own server automatically.
-`--slots N` pins the slot count, `--workers N` the number of exercises in flight.
+`llama-server` is the one Ollama ships: in `lib/ollama/` beside `ollama.exe` on Windows, beside the `ollama`
+binary itself on macOS (`Ollama.app/Contents/Resources/`). If it cannot be used at all, everything falls back
+to Ollama's own server automatically, one request at a time, and the log says why. A GGUF made here - the f16
+base, a fine-tuned version - is then imported into Ollama from its file, under the base model's own chat
+template and parameters. `--slots N` pins the slot count, `--workers N` the number of exercises in flight.
 
 ## The dashboard
 

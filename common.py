@@ -6,7 +6,7 @@ the model registry, the Python code checker and the dashboard HTTP server.
 Standard library only. Heavy dependencies (torch, mlx, pyarrow, ...) live in a project-local venv that
 `Venv` creates and fills on demand, so nothing ever has to be installed by hand.
 """
-import atexit, itertools, json, os, platform, re, shutil, signal, subprocess, sys, tarfile, threading, time
+import atexit, hashlib, itertools, json, os, platform, re, shutil, signal, subprocess, sys, tarfile, threading, time
 import urllib.error, urllib.parse, urllib.request, webbrowser, zipfile
 from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -466,6 +466,12 @@ class Gen:
 
 
 # ---------------------------------------------------------------- Ollama: model downloads + fallback backend
+# How a Qwen model's chat reads to Ollama when the base model's own Modelfile cannot be had: ChatML, which is what
+# llama-server is told to use as well (--chat-template chatml).
+CHATML_MODELFILE = ('TEMPLATE """{{- range .Messages }}<|im_start|>{{ .Role }}\n{{ .Content }}<|im_end|>\n'
+                    '{{ end }}<|im_start|>assistant\n"""\nPARAMETER stop "<|im_start|>"\nPARAMETER stop "<|im_end|>"')
+
+
 class Ollama:
     """Used for two things: pulling the GGUF weights (it is the simplest reliable model source on every
     platform) and, when llama-server cannot be used, serving them itself."""
@@ -558,6 +564,61 @@ class Ollama:
                     t = time.time()
                     log("model", model.ljust(28) + " " + fmt_mb(j.get("completed", 0), j["total"]))
         log("model", "pulled " + model)
+
+    def modelfile(s, base, gguf):
+        """`base`'s own Modelfile - chat template, renderer, parameters - with its weights swapped for `gguf`:
+        every FROM outside a quoted block goes, and one FROM of the file comes first. ChatML, which Qwen models
+        speak, when the base model's cannot be read."""
+        try:
+            text = json.loads(http(s.url + "/api/show", {"model": base}, timeout=120)).get("modelfile") or ""
+        except Exception:
+            text = ""
+        keep, quoted = [], False
+        for line in text.splitlines():
+            if not quoted and re.match(r"\s*FROM\s", line, re.I):
+                continue
+            if line.count('"""') % 2:
+                quoted = not quoted
+            keep.append(line)
+        body = "\n".join(keep).strip()
+        if not re.search(r"^\s*(TEMPLATE|RENDERER)\b", body, re.M | re.I):
+            body = CHATML_MODELFILE
+        return "FROM " + ('"' + gguf + '"' if " " in gguf else gguf) + "\n" + body + "\n"
+
+    def imported(s, entry, base):
+        """The Ollama model for a GGUF made on this machine - the f16 base, a fine-tuned version - which no
+        registry has: created from the file the first time, with the base model's Modelfile, so that only the
+        weights differ. Its tag follows the file, so a GGUF made again is imported again. Returns its name."""
+        gguf = os.path.abspath(entry["gguf"])
+        st = os.stat(gguf)
+        stem = "rsi-" + re.sub(r"[^a-z0-9._-]+", "-", str(entry["id"]).lower())
+        name = stem + ":" + hashlib.sha1((gguf + "|" + str(st.st_size) + "|" +
+                                          str(int(st.st_mtime))).encode()).hexdigest()[:12]
+        names = [m.get("name", "") for m in s.tags()]
+        if name in names:
+            return name
+        for old in (n for n in names if n.startswith(stem + ":")):     # an earlier file's import, now stale
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    s.url + "/api/delete", data=json.dumps({"model": old}).encode(),
+                    headers={"Content-Type": "application/json"}, method="DELETE"), timeout=60)
+            except Exception:
+                pass
+        mf = os.path.join(LOGS, stem + ".modelfile")
+        with open(mf, "w", encoding="utf-8") as f:
+            f.write(s.modelfile(base, gguf))
+        log("model", "importing " + str(entry["id"]) + " into Ollama as " + name + " (" +
+            format(st.st_size / 1e9, ".2f") + " GB, the first time only)")
+        with open(os.path.join(LOGS, "ollama_create.log"), "a", encoding="utf-8") as lf:
+            lf.write("\n===== " + time.strftime("%Y-%m-%d %H:%M:%S") + " " + name + " from " + gguf + " =====\n")
+            lf.flush()
+            r = subprocess.run([s.binary(), "create", name, "-f", mf], stdout=lf, stderr=subprocess.STDOUT,
+                               env=dict(os.environ, OLLAMA_HOST="127.0.0.1:" + str(s.port)))
+        if r.returncode != 0 or name not in [m.get("name", "") for m in s.tags()]:
+            raise SystemExit("Ollama could not import " + gguf + " (exit " + str(r.returncode) + "); what it said "
+                             "is in logs/ollama_create.log")
+        log("model", "imported " + name)
+        return name
 
     def chat(s, model, system, user, max_tokens, temp, gen=None, sampler=None):
         body = {"model": model, "stream": True, "keep_alive": -1, "think": False,
@@ -691,16 +752,29 @@ class LlamaServer:
         s.url = "http://127.0.0.1:" + str(port)
         s.proc, s.slots, s.inflight, s.lock, s.crashes = None, want_slots or 4, 0, threading.Lock(), []
         s.ngl = 999
-        s.libdir = os.path.join(os.path.dirname(os.path.realpath(ollama_exe)), "lib", "ollama") if ollama_exe else ""
+        # Where Ollama keeps llama-server and its libraries: lib/ollama/ beside ollama.exe on Windows, beside the
+        # ollama binary itself on macOS (Ollama.app/Contents/Resources/), ../lib/ollama/ on Linux.
         exe = "llama-server.exe" if WIN else "llama-server"
+        home = os.path.dirname(os.path.realpath(ollama_exe)) if ollama_exe else ""
+        s.looked = [os.path.normpath(d) for d in (os.path.join(home, "lib", "ollama"), home,
+                                                  os.path.join(home, os.pardir, "lib", "ollama"))] if home else []
+        s.libdir = next((d for d in s.looked if os.path.exists(os.path.join(d, exe))), s.looked[0] if s.looked else "")
         s.exe = os.path.join(s.libdir, exe) if s.libdir else ""
-        if s.exe and not os.path.exists(s.exe):
-            alt = shutil.which(exe)
-            s.exe = alt or s.exe
+        if not os.path.exists(s.exe) and shutil.which(exe):     # one installed on its own, with its own libraries
+            s.exe = shutil.which(exe)
+            s.libdir = os.path.dirname(os.path.realpath(s.exe))
         s.backend, s.logf = None, os.path.join(LOGS, "llama_server.log")
 
     def available(s):
         return bool(s.exe) and os.path.exists(s.exe) and s.gguf and os.path.exists(s.gguf)
+
+    def why_not(s):
+        """Why this server cannot be used, for the log."""
+        if not (s.exe and os.path.exists(s.exe)):
+            return "no llama-server beside Ollama (" + ", ".join(s.looked or ["Ollama not found"]) + ") or on the PATH"
+        if not (s.gguf and os.path.exists(s.gguf)):
+            return "its weights are missing: " + str(s.gguf)
+        return "llama-server did not start with these weights; its output is in logs/llama_server.log"
 
     def _alive(s):
         try:
@@ -1004,18 +1078,15 @@ class Backend:
                 s.servers[role], s.entries[role] = srv, entry
                 s.kind = "llama"
                 return srv
-            # Ollama can only serve a model from its own registry, so a fine-tuned GGUF has no fallback:
-            # say so plainly rather than failing later with an unhelpful "model not found".
-            if entry.get("id") not in ("base", "base_f16"):
-                raise SystemExit(
-                    "llama-server could not be started for " + entry["id"] + ", and Ollama cannot serve a "
-                    "locally produced GGUF. Free up GPU memory (or pass --backend llama --slots 1) and "
-                    "re-run; the weights are at " + str(entry.get("gguf")))
-            log("warn", "llama-server unusable for " + entry["id"] + "; falling back to Ollama", "yellow")
+            log("warn", "llama-server unusable for " + entry["id"] + " (" +
+                ("--backend ollama" if s.prefer == "ollama" else srv.why_not()) + "); falling back to Ollama", "yellow")
             if not s.ollama.alive():
                 s.ollama.start()
             Stop.on_exit(s.ollama.stop)
-            s.ollama.pull(entry["name"])
+            if entry.get("id") == "base":       # a model from Ollama's library, pulled by its name
+                s.ollama.pull(entry["name"])
+            else:   # a GGUF made here - the f16 base, a fine-tuned version - exists nowhere else: Ollama imports it
+                entry = dict(entry, name=s.ollama.imported(entry, (Registry.load().get("base") or {}).get("name")))
             s.servers[role], s.entries[role] = s.ollama, entry
             s.kind = "ollama"
             return s.ollama
